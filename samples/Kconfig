@@ -326,6 +326,8 @@ source "samples/rust/Kconfig"
 
 source "samples/damon/Kconfig"
 
+source "samples/pci/Kconfig"
+
 endif # SAMPLES
 
 config HAVE_SAMPLE_FTRACE_DIRECT
