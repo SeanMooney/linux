@@ -29,6 +29,7 @@
 #include <linux/tty_flip.h>
 #include <linux/uaccess.h>
 #include <linux/vfio_pci_core.h>
+#include <linux/string.h>
 #include <asm/pci.h>
 
 /*
@@ -845,12 +846,29 @@ static struct pci_driver fake_pci_pf_driver = {
  * ============================================================================
  */
 
+static void pci_sim_uart_reset(struct pci_sim_uart *uart)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&uart->lock, flags);
+	memset(uart->regs, 0, sizeof(uart->regs));
+	uart->head = 0;
+	uart->tail = 0;
+	uart->count = 0;
+	uart->dlab = false;
+	uart->overrun = false;
+	uart->divisor = 0;
+	uart->fcr = 0;
+	uart->intr_trigger_level = 1;
+	uart->regs[UART_LSR] = UART_LSR_TEMT | UART_LSR_THRE;
+	uart->regs[UART_MSR] = UART_MSR_DSR | UART_MSR_DCD | UART_MSR_CTS;
+	spin_unlock_irqrestore(&uart->lock, flags);
+}
+
 static void pci_sim_uart_init(struct pci_sim_uart *uart)
 {
 	spin_lock_init(&uart->lock);
-	uart->regs[UART_LSR] = UART_LSR_TEMT | UART_LSR_THRE;
-	uart->regs[UART_MSR] = UART_MSR_DSR | UART_MSR_DCD | UART_MSR_CTS;
-	uart->intr_trigger_level = 1;
+	pci_sim_uart_reset(uart);
 }
 
 static unsigned int pci_sim_uart_space_locked(struct pci_sim_uart *uart)
@@ -970,6 +988,35 @@ static u8 pci_sim_uart_read_data(struct pci_sim_uart *uart)
 	return val;
 }
 
+static u8 pci_sim_uart_iir(struct pci_sim_uart *uart)
+{
+	unsigned long flags;
+	u8 iir, ier;
+
+	spin_lock_irqsave(&uart->lock, flags);
+	ier = uart->regs[UART_IER];
+
+	if ((ier & UART_IER_RLSI) && uart->overrun)
+		iir = UART_IIR_RLSI;
+	else if ((ier & UART_IER_RDI) &&
+		 uart->count >= uart->intr_trigger_level)
+		iir = UART_IIR_RDI;
+	else if (ier & UART_IER_THRI)
+		iir = UART_IIR_THRI;
+	else if ((ier & UART_IER_MSI) &&
+		 (uart->regs[UART_MCR] & (UART_MCR_RTS | UART_MCR_DTR)))
+		iir = UART_IIR_MSI;
+	else
+		iir = UART_IIR_NO_INT;
+
+	if (uart->fcr & UART_FCR_ENABLE_FIFO)
+		iir |= UART_IIR_FIFO_ENABLED_16550A;
+
+	spin_unlock_irqrestore(&uart->lock, flags);
+
+	return iir;
+}
+
 static void pci_sim_uart_clear_fifo(struct pci_sim_uart *uart)
 {
 	unsigned long flags;
@@ -999,14 +1046,9 @@ static u8 pci_sim_uart_read_reg(struct pci_sim_uart *uart, u8 reg)
 	case UART_RX:
 		return pci_sim_uart_read_data(uart);
 	case UART_IER:
-		return uart->regs[UART_IER];
+		return uart->regs[UART_IER] & 0x0f;
 	case UART_IIR:
-		if ((uart->regs[UART_IER] & UART_IER_RDI) &&
-		    pci_sim_uart_chars_in_buffer(uart))
-			return UART_IIR_RDI;
-		if (uart->regs[UART_IER] & UART_IER_THRI)
-			return UART_IIR_THRI;
-		return UART_IIR_NO_INT;
+		return pci_sim_uart_iir(uart);
 	case UART_LCR:
 		return uart->regs[UART_LCR];
 	case UART_MCR:
@@ -1042,11 +1084,25 @@ static void pci_sim_uart_write_reg(struct pci_sim_uart *uart, u8 reg, u8 val)
 		pci_sim_uart_write_data(uart, &val, 1);
 		break;
 	case UART_IER:
-		uart->regs[UART_IER] = val;
+		uart->regs[UART_IER] = val & 0x0f;
 		break;
 	case UART_FCR:
 		uart->fcr = val;
-		if (val & UART_FCR_CLEAR_RCVR)
+		switch (val & UART_FCR_TRIGGER_MASK) {
+		case UART_FCR_TRIGGER_1:
+			uart->intr_trigger_level = 1;
+			break;
+		case UART_FCR_TRIGGER_4:
+			uart->intr_trigger_level = 4;
+			break;
+		case UART_FCR_TRIGGER_8:
+			uart->intr_trigger_level = 8;
+			break;
+		case UART_FCR_TRIGGER_14:
+			uart->intr_trigger_level = 14;
+			break;
+		}
+		if (val & (UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT))
 			pci_sim_uart_clear_fifo(uart);
 		break;
 	case UART_LCR:
@@ -1326,8 +1382,28 @@ static int pci_sim_vfio_open_device(struct vfio_device *core_vdev)
 	if (ret)
 		return ret;
 
+	pci_sim_uart_reset(&sim->uart);
 	vfio_pci_core_finish_enable(&sim->core);
 	return 0;
+}
+
+static bool pci_sim_vfio_bar0_uart_reg(loff_t pos, u8 *reg)
+{
+	loff_t offset;
+
+	if (vfio_guest_8250_compat) {
+		if (pos < PCI_SIM_SGI_IOC3_UART_OFFSET ||
+		    pos >= PCI_SIM_SGI_IOC3_UART_OFFSET + 8)
+			return false;
+		offset = pos - PCI_SIM_SGI_IOC3_UART_OFFSET;
+	} else {
+		if (pos >= 8)
+			return false;
+		offset = pos;
+	}
+
+	*reg = offset;
+	return true;
 }
 
 static ssize_t pci_sim_vfio_bar0_rw(struct pci_sim_vfio_vf *sim,
@@ -1336,7 +1412,7 @@ static ssize_t pci_sim_vfio_bar0_rw(struct pci_sim_vfio_vf *sim,
 {
 	loff_t pos = *ppos & VFIO_PCI_OFFSET_MASK;
 	size_t done;
-	u8 val;
+	u8 reg, val;
 
 	if (pos >= PCI_SIM_VFIO_BAR0_SIZE)
 		return -EINVAL;
@@ -1350,25 +1426,21 @@ static ssize_t pci_sim_vfio_bar0_rw(struct pci_sim_vfio_vf *sim,
 				mutex_unlock(&sim->lock);
 				return done ?: -EFAULT;
 			}
-			loff_t reg_pos = pos + done;
-
-			if (reg_pos >= PCI_SIM_SGI_IOC3_UART_OFFSET)
-				reg_pos -= PCI_SIM_SGI_IOC3_UART_OFFSET;
+			if (!pci_sim_vfio_bar0_uart_reg(pos + done, &reg))
+				continue;
 			if (vfio_uart_trace)
 				pr_info("fake_pci: vfio uart W off=0x%llx reg=%u val=0x%02x\n",
-					(unsigned long long)(pos + done),
-					(unsigned int)(reg_pos & 7), val);
-			pci_sim_uart_write_reg(&sim->uart, reg_pos & 7, val);
+					(unsigned long long)(pos + done), reg, val);
+			pci_sim_uart_write_reg(&sim->uart, reg, val);
 		} else {
-			loff_t reg_pos = pos + done;
-
-			if (reg_pos >= PCI_SIM_SGI_IOC3_UART_OFFSET)
-				reg_pos -= PCI_SIM_SGI_IOC3_UART_OFFSET;
-			val = pci_sim_uart_read_reg(&sim->uart, reg_pos & 7);
-			if (vfio_uart_trace)
-				pr_info("fake_pci: vfio uart R off=0x%llx reg=%u val=0x%02x\n",
-					(unsigned long long)(pos + done),
-					(unsigned int)(reg_pos & 7), val);
+			if (pci_sim_vfio_bar0_uart_reg(pos + done, &reg)) {
+				val = pci_sim_uart_read_reg(&sim->uart, reg);
+				if (vfio_uart_trace)
+					pr_info("fake_pci: vfio uart R off=0x%llx reg=%u val=0x%02x\n",
+						(unsigned long long)(pos + done), reg, val);
+			} else {
+				val = 0xff;
+			}
 			if (copy_to_user(buf + done, &val, 1)) {
 				mutex_unlock(&sim->lock);
 				return done ?: -EFAULT;
@@ -1408,10 +1480,12 @@ static ssize_t pci_sim_vfio_read_config(struct vfio_device *core_vdev,
 	__le16 val16;
 	__le32 val32;
 	ssize_t ret;
+	size_t done;
 
 	ret = vfio_pci_core_read(core_vdev, buf, count, ppos);
-	if (ret < 0 || !vfio_guest_8250_compat)
+	if (ret <= 0 || !vfio_guest_8250_compat)
 		return ret;
+	done = ret;
 
 	/*
 	 * The fake host keeps local experimental IDs (1d55:1001), but many guest
@@ -1420,28 +1494,28 @@ static ssize_t pci_sim_vfio_read_config(struct vfio_device *core_vdev,
 	 * space because that 8250_pci entry is MMIO and polling/no-IRQ based.
 	 */
 	val16 = cpu_to_le16(PCI_VENDOR_ID_SGI);
-	if (pci_sim_vfio_copy_config_value(buf, pos, count, PCI_VENDOR_ID,
+	if (pci_sim_vfio_copy_config_value(buf, pos, done, PCI_VENDOR_ID,
 					   &val16, sizeof(val16)))
 		return -EFAULT;
 
 	val16 = cpu_to_le16(PCI_DEVICE_ID_SGI_IOC3);
-	if (pci_sim_vfio_copy_config_value(buf, pos, count, PCI_DEVICE_ID,
+	if (pci_sim_vfio_copy_config_value(buf, pos, done, PCI_DEVICE_ID,
 					   &val16, sizeof(val16)))
 		return -EFAULT;
 
 	val32 = cpu_to_le32(FAKE_PCI_CLASS << 8);
-	if (pci_sim_vfio_copy_config_value(buf, pos, count, PCI_CLASS_REVISION,
+	if (pci_sim_vfio_copy_config_value(buf, pos, done, PCI_CLASS_REVISION,
 					   &val32, sizeof(val32)))
 		return -EFAULT;
 
 	val16 = cpu_to_le16(0xff00);
-	if (pci_sim_vfio_copy_config_value(buf, pos, count,
+	if (pci_sim_vfio_copy_config_value(buf, pos, done,
 					   PCI_SUBSYSTEM_VENDOR_ID,
 					   &val16, sizeof(val16)))
 		return -EFAULT;
 
 	val16 = cpu_to_le16(0);
-	if (pci_sim_vfio_copy_config_value(buf, pos, count, PCI_SUBSYSTEM_ID,
+	if (pci_sim_vfio_copy_config_value(buf, pos, done, PCI_SUBSYSTEM_ID,
 					   &val16, sizeof(val16)))
 		return -EFAULT;
 
