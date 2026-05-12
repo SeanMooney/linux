@@ -89,6 +89,12 @@ PCI core support.  The sample Kconfig dependency is
 - `num_pfs` (uint, default `1`): number of independent fake SR-IOV PFs to
   create.  The current maximum is 16.  Each PF is created in its own conventional
   PCI domain and owns its own VFs.
+- `mem_base` (ulong, default `0`): fixed base address for the first fake PCI
+  MMIO window.  The default `0` asks the kernel resource allocator to choose
+  unused 32-bit MMIO space at or above `0xd0000000`.
+- `mem_stride` (ulong, default `0x100000`): size and alignment of each fake PCI
+  host MMIO window.  The stride must be large enough for the PF BAR and the VF
+  BAR aperture.
 
 ## Manual VFIO flow
 
@@ -210,7 +216,11 @@ PY
 
 ## Multiple PFs
 
-Use `num_pfs` to create more than one independent fake SR-IOV parent:
+Use `num_pfs` to create more than one independent fake SR-IOV parent.  By
+default, the sample asks the kernel resource allocator to choose unused 32-bit
+MMIO windows for each fake host bridge.  Use `mem_base` only when a deterministic
+window is needed for a controlled test environment.
+
 
 ```sh
 sudo insmod samples/pci/fake_pci_sriov.ko num_pfs=2

@@ -31,6 +31,7 @@
 #include <linux/vfio_pci_core.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+#include <linux/ioport.h>
 #ifdef CONFIG_X86
 #include <asm/pci.h>
 #elif defined(CONFIG_ACPI)
@@ -59,6 +60,7 @@
 #define BAR0_SIZE		0x1000	/* 4KB host-visible MMIO region */
 #define FAKE_PCI_MEM_BASE	0xd0000000
 #define FAKE_PCI_MEM_STRIDE	0x00100000
+#define FAKE_PCI_MEM_MIN_SIZE	(BAR0_SIZE * (MAX_VFS + 1))
 #define PCI_SIM_VFIO_BAR0_SIZE	0x40000	/* Guest SGI IOC3 window size */
 #define PCI_SIM_SGI_IOC3_UART_OFFSET 0x20178
 
@@ -93,6 +95,16 @@ module_param(num_pfs, uint, 0444);
 MODULE_PARM_DESC(num_pfs,
 		 "Number of fake SR-IOV PFs to create");
 
+static unsigned long mem_base;
+module_param(mem_base, ulong, 0444);
+MODULE_PARM_DESC(mem_base,
+		 "Fixed fake PCI MMIO window base address (0 chooses automatically)");
+
+static unsigned long mem_stride = FAKE_PCI_MEM_STRIDE;
+module_param(mem_stride, ulong, 0444);
+MODULE_PARM_DESC(mem_stride,
+		 "Size and alignment of each fake PCI host MMIO window");
+
 static LIST_HEAD(fake_hosts);
 static DEFINE_MUTEX(fake_hosts_lock);
 
@@ -120,6 +132,7 @@ struct fake_pci_host {
 #endif
 	struct resource bus_resource;
 	struct resource mem_resource;
+	bool mem_resource_registered;
 	struct fake_pci_device pf;
 	struct fake_pci_device vfs[MAX_VFS];
 	int num_vfs_enabled;
@@ -1895,10 +1908,59 @@ static int fake_pci_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 	return fake_intx_irq ?: -1;
 }
 
+static void fake_pci_host_release_mem_resource(struct fake_pci_host *host)
+{
+	if (!host->mem_resource_registered)
+		return;
+
+	release_resource(&host->mem_resource);
+	host->mem_resource_registered = false;
+}
+
+static int fake_pci_host_init_mem_resource(struct fake_pci_host *host,
+					   unsigned int index)
+{
+	resource_size_t mem_start, max_32 = U32_MAX;
+	resource_size_t stride = mem_stride;
+	int ret;
+
+	if (stride < FAKE_PCI_MEM_MIN_SIZE) {
+		pr_err("fake_pci: mem_stride must be at least %#llx\n",
+		       (unsigned long long)FAKE_PCI_MEM_MIN_SIZE);
+		return -EINVAL;
+	}
+
+	host->mem_resource.flags = IORESOURCE_MEM;
+	host->mem_resource.name = "fake_pci_mem";
+
+	if (mem_base) {
+		if (mem_base > max_32 || stride > max_32 ||
+		    index > (max_32 - mem_base + 1) / stride) {
+			pr_err("fake_pci: fixed MMIO window exceeds 32-bit BAR space\n");
+			return -EINVAL;
+		}
+
+		mem_start = mem_base + index * stride;
+		host->mem_resource.start = mem_start;
+		host->mem_resource.end = mem_start + stride - 1;
+		return 0;
+	}
+
+	ret = allocate_resource(&iomem_resource, &host->mem_resource, stride,
+				FAKE_PCI_MEM_BASE, max_32, stride, NULL, NULL);
+	if (ret) {
+		pr_err("fake_pci: failed to allocate %#llx-byte MMIO window: %d\n",
+		       (unsigned long long)stride, ret);
+		return ret;
+	}
+
+	host->mem_resource_registered = true;
+	return 0;
+}
+
 static int fake_pci_host_probe(struct fake_pci_host *host, unsigned int index)
 {
 	struct pci_host_bridge *bridge;
-	resource_size_t mem_start;
 	int err;
 
 	mutex_init(&host->lock);
@@ -1921,11 +1983,9 @@ static int fake_pci_host_probe(struct fake_pci_host *host, unsigned int index)
 	 * request_mem_region() when servicing trapped BAR accesses; placing this
 	 * window inside RAM makes that reservation fail with -EBUSY.
 	 */
-	mem_start = FAKE_PCI_MEM_BASE + index * FAKE_PCI_MEM_STRIDE;
-	host->mem_resource.start = mem_start;
-	host->mem_resource.end = mem_start + FAKE_PCI_MEM_STRIDE - 1;
-	host->mem_resource.flags = IORESOURCE_MEM;
-	host->mem_resource.name = "fake_pci_mem";
+	err = fake_pci_host_init_mem_resource(host, index);
+	if (err)
+		goto err_mutex;
 
 	/* Initialize the PF */
 	init_pf_config_space(&host->pf);
@@ -1978,6 +2038,7 @@ err_del_host:
 	list_del(&host->list);
 	mutex_unlock(&fake_hosts_lock);
 	pci_free_host_bridge(bridge);
+	fake_pci_host_release_mem_resource(host);
 err_mutex:
 	mutex_destroy(&host->lock);
 	return err;
@@ -2000,6 +2061,8 @@ static void fake_pci_host_remove(struct fake_pci_host *host)
 	mutex_lock(&fake_hosts_lock);
 	list_del_init(&host->list);
 	mutex_unlock(&fake_hosts_lock);
+
+	fake_pci_host_release_mem_resource(host);
 
 	pdev = host->pdev;
 	mutex_destroy(&host->lock);
