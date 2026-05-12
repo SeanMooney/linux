@@ -45,11 +45,14 @@
 
 /* SR-IOV configuration */
 #define MAX_VFS			7
+#define FAKE_PCI_MAX_HOSTS	16
 #define SRIOV_CAP_OFFSET	0x100	/* Extended capability offset */
 #define PCIE_CAP_OFFSET		0x40	/* PCIe capability offset */
 
 /* BAR configuration */
 #define BAR0_SIZE		0x1000	/* 4KB host-visible MMIO region */
+#define FAKE_PCI_MEM_BASE	0xd0000000
+#define FAKE_PCI_MEM_STRIDE	0x00100000
 #define PCI_SIM_VFIO_BAR0_SIZE	0x40000	/* Guest SGI IOC3 window size */
 #define PCI_SIM_SGI_IOC3_UART_OFFSET 0x20178
 
@@ -79,8 +82,13 @@ module_param(fake_intx_irq, int, 0644);
 MODULE_PARM_DESC(fake_intx_irq,
 		 "Optional host IRQ number to report for fake PCI INTx routing (0 disables)");
 
-/* Forward declarations */
-static struct fake_pci_host *fake_host;
+static unsigned int num_pfs = 1;
+module_param(num_pfs, uint, 0444);
+MODULE_PARM_DESC(num_pfs,
+		 "Number of fake SR-IOV PFs to create");
+
+static LIST_HEAD(fake_hosts);
+static DEFINE_MUTEX(fake_hosts_lock);
 
 /*
  * ============================================================================
@@ -97,9 +105,12 @@ struct fake_pci_device {
 };
 
 struct fake_pci_host {
+	struct list_head list;
 	struct pci_host_bridge *bridge;
 	struct platform_device *pdev;
 	struct pci_sysdata sysdata;
+	struct resource bus_resource;
+	struct resource mem_resource;
 	struct fake_pci_device pf;
 	struct fake_pci_device vfs[MAX_VFS];
 	int num_vfs_enabled;
@@ -148,26 +159,6 @@ static struct platform_device *fake_iommu_pdev;
 static DEFINE_IDR(pci_sim_tty_idr);
 static DEFINE_MUTEX(pci_sim_tty_idr_lock);
 static struct tty_driver *pci_sim_tty_driver;
-
-/* Static resources for PCI bus (must not be stack-allocated). */
-static struct resource fake_pci_bus_resource = {
-	.start	= 0,
-	.end	= 0,
-	.flags	= IORESOURCE_BUS,
-	.name	= "fake_pci_bus",
-};
-
-static struct resource fake_pci_mem_resource = {
-	/*
-	 * Keep the fake PCI MMIO window out of System RAM.  VFIO reserves BARs
-	 * with request_mem_region() when servicing trapped BAR accesses; placing
-	 * this window inside RAM makes that reservation fail with -EBUSY.
-	 */
-	.start	= 0xd0000000,
-	.end	= 0xd00fffff,
-	.flags	= IORESOURCE_MEM,
-	.name	= "fake_pci_mem",
-};
 
 struct fake_iommu_domain {
 	struct iommu_domain domain;
@@ -329,16 +320,29 @@ static bool fake_iommu_capable(struct device *dev, enum iommu_cap cap)
 
 static struct iommu_device *fake_iommu_probe_device(struct device *dev)
 {
+	struct fake_pci_host *host;
 	struct pci_dev *pdev;
+	bool found = false;
+	int domain;
 
 	/* Only claim PCI devices */
 	if (!dev_is_pci(dev))
 		return ERR_PTR(-ENODEV);
 
 	pdev = to_pci_dev(dev);
+	domain = pci_domain_nr(pdev->bus);
 
-	/* Only claim devices on our fake PCI domain */
-	if (!fake_host || pci_domain_nr(pdev->bus) != fake_host->domain_nr)
+	/* Only claim devices on our fake PCI domains. */
+	mutex_lock(&fake_hosts_lock);
+	list_for_each_entry(host, &fake_hosts, list) {
+		if (domain == host->domain_nr) {
+			found = true;
+			break;
+		}
+	}
+	mutex_unlock(&fake_hosts_lock);
+
+	if (!found)
 		return ERR_PTR(-ENODEV);
 
 	dev_info(dev, "fake_iommu: probed device %04x:%02x:%02x.%d\n",
@@ -600,7 +604,8 @@ static struct fake_pci_device *get_fake_device(struct fake_pci_host *host,
 static int fake_pci_read_config(struct pci_bus *bus, unsigned int devfn,
 				int where, int size, u32 *val)
 {
-	struct fake_pci_host *host = fake_host;
+	struct fake_pci_host *host = container_of(bus->sysdata,
+							 struct fake_pci_host, sysdata);
 	struct fake_pci_device *dev;
 
 	/* Only bus 0 has devices */
@@ -638,7 +643,8 @@ static bool fake_pci_is_sriov_cfg(int where)
 static int fake_pci_write_config(struct pci_bus *bus, unsigned int devfn,
 				 int where, int size, u32 val)
 {
-	struct fake_pci_host *host = fake_host;
+	struct fake_pci_host *host = container_of(bus->sysdata,
+							 struct fake_pci_host, sysdata);
 	struct fake_pci_device *dev;
 	u8 *config;
 
@@ -776,30 +782,57 @@ static void handle_sriov_numvfs_write(struct fake_pci_host *host, u16 num_vfs)
  * ============================================================================
  */
 
+static struct fake_pci_host *fake_pci_host_from_pdev(struct pci_dev *pdev)
+{
+	struct fake_pci_host *host;
+	int domain = pci_domain_nr(pdev->bus);
+
+	mutex_lock(&fake_hosts_lock);
+	list_for_each_entry(host, &fake_hosts, list) {
+		if (domain == host->domain_nr) {
+			mutex_unlock(&fake_hosts_lock);
+			return host;
+		}
+	}
+	mutex_unlock(&fake_hosts_lock);
+
+	return NULL;
+}
+
 static int fake_pci_pf_probe(struct pci_dev *pdev,
 			     const struct pci_device_id *id)
 {
+	struct fake_pci_host *host = fake_pci_host_from_pdev(pdev);
+
+	if (!host)
+		return -ENODEV;
+
+	pci_set_drvdata(pdev, host);
 	pci_info(pdev, "fake_pci: PF probed\n");
 	return 0;
 }
 
 static void fake_pci_pf_remove(struct pci_dev *pdev)
 {
+	struct fake_pci_host *host = pci_get_drvdata(pdev);
+
 	if (pci_num_vf(pdev)) {
 		pci_info(pdev, "fake_pci: disabling VFs before PF removal\n");
 		pci_disable_sriov(pdev);
-		if (fake_host)
-			handle_sriov_numvfs_write(fake_host, 0);
+		if (host)
+			handle_sriov_numvfs_write(host, 0);
 	}
 
+	pci_set_drvdata(pdev, NULL);
 	pci_info(pdev, "fake_pci: PF removed\n");
 }
 
 static int fake_pci_sriov_configure(struct pci_dev *pdev, int num_vfs)
 {
+	struct fake_pci_host *host = pci_get_drvdata(pdev);
 	int err;
 
-	if (!fake_host)
+	if (!host)
 		return -ENODEV;
 
 	if (num_vfs < 0 || num_vfs > MAX_VFS)
@@ -807,19 +840,19 @@ static int fake_pci_sriov_configure(struct pci_dev *pdev, int num_vfs)
 
 	if (!num_vfs) {
 		pci_disable_sriov(pdev);
-		handle_sriov_numvfs_write(fake_host, 0);
+		handle_sriov_numvfs_write(host, 0);
 		return 0;
 	}
 
-	if (fake_host->num_vfs_enabled)
+	if (host->num_vfs_enabled)
 		return -EBUSY;
 
 	/* Make VFs visible to our pci_ops before the PCI core scans them. */
-	handle_sriov_numvfs_write(fake_host, num_vfs);
+	handle_sriov_numvfs_write(host, num_vfs);
 
 	err = pci_enable_sriov(pdev, num_vfs);
 	if (err) {
-		handle_sriov_numvfs_write(fake_host, 0);
+		handle_sriov_numvfs_write(host, 0);
 		return err;
 	}
 
@@ -1720,31 +1753,41 @@ static int fake_pci_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 	return fake_intx_irq ?: -1;
 }
 
-static int fake_pci_host_probe(void)
+static int fake_pci_host_probe(struct fake_pci_host *host, unsigned int index)
 {
 	struct pci_host_bridge *bridge;
+	resource_size_t mem_start;
 	int err;
-	static int domain_nr;
 
-	/* fake_host must be allocated by caller with pdev already set */
-
-	mutex_init(&fake_host->lock);
+	mutex_init(&host->lock);
 
 	/*
-	 * Get a unique conventional 16-bit PCI segment/domain.  Avoid domain 0
-	 * because the real host bridge usually owns it, and avoid the emulated
-	 * 32-bit domains that user space such as Nova cannot represent.
+	 * Use conventional 16-bit PCI segments/domains.  Avoid domain 0 because
+	 * the real host bridge usually owns it, and avoid the emulated 32-bit
+	 * domains that user space such as Nova cannot represent.
 	 */
-	if (!domain_nr)
-		domain_nr = 1;
-	fake_host->domain_nr = domain_nr++;
-	if (domain_nr > 0xffff)
-		domain_nr = 1;
-	fake_host->sysdata.domain = fake_host->domain_nr;
-	fake_host->sysdata.node = NUMA_NO_NODE;
+	host->domain_nr = index + 1;
+	host->sysdata.domain = host->domain_nr;
+	host->sysdata.node = NUMA_NO_NODE;
+
+	host->bus_resource.start = 0;
+	host->bus_resource.end = 0;
+	host->bus_resource.flags = IORESOURCE_BUS;
+	host->bus_resource.name = "fake_pci_bus";
+
+	/*
+	 * Keep fake PCI MMIO windows out of System RAM.  VFIO reserves BARs with
+	 * request_mem_region() when servicing trapped BAR accesses; placing this
+	 * window inside RAM makes that reservation fail with -EBUSY.
+	 */
+	mem_start = FAKE_PCI_MEM_BASE + index * FAKE_PCI_MEM_STRIDE;
+	host->mem_resource.start = mem_start;
+	host->mem_resource.end = mem_start + FAKE_PCI_MEM_STRIDE - 1;
+	host->mem_resource.flags = IORESOURCE_MEM;
+	host->mem_resource.name = "fake_pci_mem";
 
 	/* Initialize the PF */
-	init_pf_config_space(&fake_host->pf);
+	init_pf_config_space(&host->pf);
 
 	/* Allocate host bridge */
 	bridge = pci_alloc_host_bridge(0);
@@ -1753,59 +1796,83 @@ static int fake_pci_host_probe(void)
 		goto err_mutex;
 	}
 
-	fake_host->bridge = bridge;
+	host->bridge = bridge;
 
 	/* Set up the bridge */
-	bridge->sysdata = &fake_host->sysdata;
+	bridge->sysdata = &host->sysdata;
 	bridge->ops = &fake_pci_ops;
 	bridge->map_irq = fake_pci_map_irq;
 	bridge->busnr = 0;
-	bridge->dev.parent = &fake_host->pdev->dev;
+	bridge->dev.parent = &host->pdev->dev;
 
 	/* Keep the host bridge's visible domain conventional as well. */
-	bridge->domain_nr = fake_host->domain_nr;
+	bridge->domain_nr = host->domain_nr;
 
 	/* Set up release function */
 	pci_set_host_bridge_release(bridge, fake_pci_release_host_bridge, NULL);
 
 	/* Add bus number and MMIO window resources. */
-	pci_add_resource(&bridge->windows, &fake_pci_bus_resource);
-	pci_add_resource(&bridge->windows, &fake_pci_mem_resource);
+	pci_add_resource(&bridge->windows, &host->bus_resource);
+	pci_add_resource(&bridge->windows, &host->mem_resource);
+
+	mutex_lock(&fake_hosts_lock);
+	list_add_tail(&host->list, &fake_hosts);
+	mutex_unlock(&fake_hosts_lock);
 
 	/* Probe the host bridge */
 	err = pci_host_probe(bridge);
 	if (err) {
-		pr_err("fake_pci: pci_host_probe failed: %d\n", err);
-		goto err_free_bridge;
+		pr_err("fake_pci: pci_host_probe failed for domain %04x: %d\n",
+		       host->domain_nr, err);
+		goto err_del_host;
 	}
 
 	pr_info("fake_pci: Host bridge created on domain %04x\n",
-		fake_host->domain_nr);
+		host->domain_nr);
 
 	return 0;
 
-err_free_bridge:
+err_del_host:
+	mutex_lock(&fake_hosts_lock);
+	list_del(&host->list);
+	mutex_unlock(&fake_hosts_lock);
 	pci_free_host_bridge(bridge);
 err_mutex:
-	mutex_destroy(&fake_host->lock);
+	mutex_destroy(&host->lock);
 	return err;
 }
 
-static void fake_pci_host_remove(void)
+static void fake_pci_host_remove(struct fake_pci_host *host)
 {
-	if (!fake_host)
+	struct platform_device *pdev;
+
+	if (!host)
 		return;
 
-	if (fake_host->bridge && fake_host->bridge->bus) {
+	mutex_lock(&fake_hosts_lock);
+	list_del_init(&host->list);
+	mutex_unlock(&fake_hosts_lock);
+
+	if (host->bridge && host->bridge->bus) {
 		pci_lock_rescan_remove();
-		pci_stop_root_bus(fake_host->bridge->bus);
-		pci_remove_root_bus(fake_host->bridge->bus);
+		pci_stop_root_bus(host->bridge->bus);
+		pci_remove_root_bus(host->bridge->bus);
 		pci_unlock_rescan_remove();
 	}
 
-	mutex_destroy(&fake_host->lock);
-	kfree(fake_host);
-	fake_host = NULL;
+	pdev = host->pdev;
+	mutex_destroy(&host->lock);
+	kfree(host);
+	if (pdev)
+		platform_device_unregister(pdev);
+}
+
+static void fake_pci_remove_all_hosts(void)
+{
+	struct fake_pci_host *host, *tmp;
+
+	list_for_each_entry_safe_reverse(host, tmp, &fake_hosts, list)
+		fake_pci_host_remove(host);
 }
 
 /*
@@ -1820,9 +1887,17 @@ static int __init fake_pci_sriov_init(void)
 		.name = "fake-pci-iommu",
 		.id = PLATFORM_DEVID_AUTO,
 	};
+	struct fake_pci_host *host;
+	unsigned int i;
 	int err;
 
 	pr_info("fake_pci: Initializing fake PCI SR-IOV driver\n");
+
+	if (!num_pfs || num_pfs > FAKE_PCI_MAX_HOSTS) {
+		pr_err("fake_pci: num_pfs must be between 1 and %u\n",
+		       FAKE_PCI_MAX_HOSTS);
+		return -EINVAL;
+	}
 
 	/*
 	 * Step 1: Create platform device for IOMMU
@@ -1882,44 +1957,43 @@ static int __init fake_pci_sriov_init(void)
 	}
 
 	/*
-	 * Step 3: Create platform device for the PCI host controller
+	 * Step 3: Create platform devices and PCI host bridges.  Devices created
+	 * here will be claimed by our IOMMU.
 	 */
 	pdevinfo.name = "fake-pci-host";
 
-	fake_host = kzalloc(sizeof(*fake_host), GFP_KERNEL);
-	if (!fake_host) {
-		err = -ENOMEM;
-		goto err_pf_driver;
+	for (i = 0; i < num_pfs; i++) {
+		host = kzalloc(sizeof(*host), GFP_KERNEL);
+		if (!host) {
+			err = -ENOMEM;
+			goto err_hosts;
+		}
+		INIT_LIST_HEAD(&host->list);
+
+		host->pdev = platform_device_register_full(&pdevinfo);
+		if (IS_ERR(host->pdev)) {
+			err = PTR_ERR(host->pdev);
+			pr_err("fake_pci: Failed to register PCI host platform device %u: %d\n",
+			       i, err);
+			kfree(host);
+			goto err_hosts;
+		}
+
+		err = fake_pci_host_probe(host, i);
+		if (err) {
+			platform_device_unregister(host->pdev);
+			kfree(host);
+			goto err_hosts;
+		}
 	}
 
-	fake_host->pdev = platform_device_register_full(&pdevinfo);
-	if (IS_ERR(fake_host->pdev)) {
-		err = PTR_ERR(fake_host->pdev);
-		pr_err("fake_pci: Failed to register PCI host platform device: %d\n",
-		       err);
-		kfree(fake_host);
-		fake_host = NULL;
-		goto err_pf_driver;
-	}
-
-	/*
-	 * Step 4: Create the fake PCI host bridge
-	 * Now devices created here will be claimed by our IOMMU.
-	 */
-	err = fake_pci_host_probe();
-	if (err) {
-		platform_device_unregister(fake_host->pdev);
-		kfree(fake_host);
-		fake_host = NULL;
-		goto err_pf_driver;
-	}
-
-	pr_info("fake_pci: Module loaded successfully\n");
+	pr_info("fake_pci: Module loaded successfully with %u PF(s)\n", num_pfs);
 	pr_info("fake_pci: Use 'echo N > /sys/bus/pci/devices/.../sriov_numvfs' to enable VFs\n");
 
 	return 0;
 
-err_pf_driver:
+err_hosts:
+	fake_pci_remove_all_hosts();
 	pci_unregister_driver(&fake_pci_pf_driver);
 err_vf_driver:
 	pci_unregister_driver(&pci_sim_vf_driver);
@@ -1941,13 +2015,7 @@ static void __exit fake_pci_sriov_exit(void)
 	pr_info("fake_pci: Unloading module\n");
 
 	/* Remove PCI devices before unregistering their drivers. */
-	if (fake_host) {
-		struct platform_device *pdev = fake_host->pdev;
-
-		fake_pci_host_remove();
-		if (pdev)
-			platform_device_unregister(pdev);
-	}
+	fake_pci_remove_all_hosts();
 
 	pci_unregister_driver(&fake_pci_pf_driver);
 	pci_unregister_driver(&pci_sim_vf_driver);

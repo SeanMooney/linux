@@ -81,6 +81,9 @@ The sample depends on `VFIO_PCI_CORE`.
 - `fake_intx_irq` (int, default `0`): optional fake INTx routing value.  The
   current guest UART test uses the no-IRQ/polling IOC3 path and does not require
   this.
+- `num_pfs` (uint, default `1`): number of independent fake SR-IOV PFs to
+  create.  The current maximum is 16.  Each PF is created in its own conventional
+  PCI domain and owns its own VFs.
 
 ## Manual VFIO flow
 
@@ -149,6 +152,8 @@ Additional helper scripts are kept for narrower debugging:
 
 - `run_cirros_vfio_guest_probe.sh`: interactive-login guest probe path.
 - `run_fake_pci_qemu_vfio_smoke.sh`: minimal QEMU/VFIO attach smoke test.
+- `run_fake_pci_multi_pf_smoke.sh`: host-side smoke test for `num_pfs` and
+  independent VF creation/removal across PFs.
 
 ## Limitations
 
