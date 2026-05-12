@@ -4,7 +4,7 @@
 set -euo pipefail
 
 MODULE=${MODULE:-samples/pci/fake_pci_sriov.ko}
-MODULE_ARGS=${MODULE_ARGS:-num_pfs=2 vf_serial_class=1}
+MODULE_ARGS=${MODULE_ARGS:-num_pfs=2}
 VENDOR=${VENDOR:-0x1d55}
 PF_DEVICE=${PF_DEVICE:-0x1000}
 VF_DEVICE=${VF_DEVICE:-0x1001}

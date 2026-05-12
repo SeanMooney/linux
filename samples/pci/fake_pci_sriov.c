@@ -30,6 +30,7 @@
 #include <linux/uaccess.h>
 #include <linux/vfio_pci_core.h>
 #include <linux/string.h>
+#include <linux/unaligned.h>
 #include <asm/pci.h>
 
 /*
@@ -39,7 +40,8 @@
 #define FAKE_PCI_VENDOR_ID	0x1d55
 #define FAKE_PCI_PF_DEVICE_ID	0x1000	/* PF device ID */
 #define FAKE_PCI_VF_DEVICE_ID	0x1001	/* VF device ID */
-#define FAKE_PCI_CLASS		0x070002 /* Serial controller, 16550 */
+#define FAKE_PCI_SERIAL_CLASS	0x070002 /* Serial controller, 16550 */
+#define FAKE_PCI_VENDOR_CLASS	0xff0000
 #define FAKE_PCI_SUBSYS_VENDOR	FAKE_PCI_VENDOR_ID
 #define FAKE_PCI_SUBSYS_ID	FAKE_PCI_PF_DEVICE_ID
 
@@ -98,7 +100,6 @@ static DEFINE_MUTEX(fake_hosts_lock);
 
 struct fake_pci_device {
 	u8 config_space[4096];	/* Full PCIe extended config space */
-	u32 bar0_saved;		/* Saved BAR0 value for sizing */
 	bool present;
 	bool is_vf;
 	int vf_index;		/* VF index (0-6) for VFs */
@@ -159,6 +160,61 @@ static struct platform_device *fake_iommu_pdev;
 static DEFINE_IDR(pci_sim_tty_idr);
 static DEFINE_MUTEX(pci_sim_tty_idr_lock);
 static struct tty_driver *pci_sim_tty_driver;
+
+static u16 fake_cfg_read16(const u8 *config, int where)
+{
+	return get_unaligned_le16(config + where);
+}
+
+static u32 fake_cfg_read32(const u8 *config, int where)
+{
+	return get_unaligned_le32(config + where);
+}
+
+static void fake_cfg_write16(u8 *config, int where, u16 val)
+{
+	put_unaligned_le16(val, config + where);
+}
+
+static void fake_cfg_write32(u8 *config, int where, u32 val)
+{
+	put_unaligned_le32(val, config + where);
+}
+
+static int fake_cfg_read(const u8 *config, int where, int size, u32 *val)
+{
+	switch (size) {
+	case 1:
+		*val = config[where];
+		return PCIBIOS_SUCCESSFUL;
+	case 2:
+		*val = fake_cfg_read16(config, where);
+		return PCIBIOS_SUCCESSFUL;
+	case 4:
+		*val = fake_cfg_read32(config, where);
+		return PCIBIOS_SUCCESSFUL;
+	default:
+		*val = ~0;
+		return PCIBIOS_BAD_REGISTER_NUMBER;
+	}
+}
+
+static int fake_cfg_write(u8 *config, int where, int size, u32 val)
+{
+	switch (size) {
+	case 1:
+		config[where] = val;
+		return PCIBIOS_SUCCESSFUL;
+	case 2:
+		fake_cfg_write16(config, where, val);
+		return PCIBIOS_SUCCESSFUL;
+	case 4:
+		fake_cfg_write32(config, where, val);
+		return PCIBIOS_SUCCESSFUL;
+	default:
+		return PCIBIOS_BAD_REGISTER_NUMBER;
+	}
+}
 
 struct fake_iommu_domain {
 	struct iommu_domain domain;
@@ -390,6 +446,8 @@ static void fake_pci_set_class(u8 *config, u32 class)
 static void init_pcie_capability(u8 *config, bool is_pf)
 {
 	u8 *cap = &config[PCIE_CAP_OFFSET];
+	u32 link_cap;
+	u16 exp_flags, link_status;
 
 	/* Capability ID */
 	cap[PCI_CAP_LIST_ID] = PCI_CAP_ID_EXP;
@@ -397,25 +455,25 @@ static void init_pcie_capability(u8 *config, bool is_pf)
 	cap[PCI_CAP_LIST_NEXT] = 0;
 
 	/* PCIe Capabilities Register: version in bits 3:0, type in bits 7:4. */
-	*(u16 *)&cap[PCI_EXP_FLAGS] = 2 |
-				      (PCI_EXP_TYPE_ENDPOINT << 4);
+	exp_flags = 2 | (PCI_EXP_TYPE_ENDPOINT << 4);
+	fake_cfg_write16(cap, PCI_EXP_FLAGS, exp_flags);
 
 	/* Device Capabilities */
-	*(u32 *)&cap[PCI_EXP_DEVCAP] = PCI_EXP_DEVCAP_FLR;
+	fake_cfg_write32(cap, PCI_EXP_DEVCAP, PCI_EXP_DEVCAP_FLR);
 
 	/* Device Control - nothing enabled */
-	*(u16 *)&cap[PCI_EXP_DEVCTL] = 0;
+	fake_cfg_write16(cap, PCI_EXP_DEVCTL, 0);
 
 	/* Device Status */
-	*(u16 *)&cap[PCI_EXP_DEVSTA] = 0;
+	fake_cfg_write16(cap, PCI_EXP_DEVSTA, 0);
 
 	/* Link Capabilities - Gen1 x1 */
-	*(u32 *)&cap[PCI_EXP_LNKCAP] = PCI_EXP_LNKCAP_SLS_2_5GB |
-				       (1 << 4); /* x1 width */
+	link_cap = PCI_EXP_LNKCAP_SLS_2_5GB | (1 << 4); /* x1 width */
+	fake_cfg_write32(cap, PCI_EXP_LNKCAP, link_cap);
 
 	/* Link Status - Gen1 x1 */
-	*(u16 *)&cap[PCI_EXP_LNKSTA] = PCI_EXP_LNKSTA_CLS_2_5GB |
-				       PCI_EXP_LNKSTA_NLW_X1;
+	link_status = PCI_EXP_LNKSTA_CLS_2_5GB | PCI_EXP_LNKSTA_NLW_X1;
+	fake_cfg_write16(cap, PCI_EXP_LNKSTA, link_status);
 }
 
 static void init_sriov_capability(u8 *config)
@@ -423,47 +481,47 @@ static void init_sriov_capability(u8 *config)
 	u8 *cap = &config[SRIOV_CAP_OFFSET];
 
 	/* Extended Capability Header */
-	*(u16 *)&cap[0] = PCI_EXT_CAP_ID_SRIOV;
-	*(u16 *)&cap[2] = 0;	/* Next cap offset (none) */
+	fake_cfg_write16(cap, 0, PCI_EXT_CAP_ID_SRIOV);
+	fake_cfg_write16(cap, 2, 0); /* Next cap offset (none) */
 
 	/* SR-IOV Capabilities */
-	*(u32 *)&cap[PCI_SRIOV_CAP] = 0;
+	fake_cfg_write32(cap, PCI_SRIOV_CAP, 0);
 
 	/* SR-IOV Control - initially disabled */
-	*(u16 *)&cap[PCI_SRIOV_CTRL] = 0;
+	fake_cfg_write16(cap, PCI_SRIOV_CTRL, 0);
 
 	/* SR-IOV Status */
-	*(u16 *)&cap[PCI_SRIOV_STATUS] = 0;
+	fake_cfg_write16(cap, PCI_SRIOV_STATUS, 0);
 
 	/* Initial VFs */
-	*(u16 *)&cap[PCI_SRIOV_INITIAL_VF] = MAX_VFS;
+	fake_cfg_write16(cap, PCI_SRIOV_INITIAL_VF, MAX_VFS);
 
 	/* Total VFs */
-	*(u16 *)&cap[PCI_SRIOV_TOTAL_VF] = MAX_VFS;
+	fake_cfg_write16(cap, PCI_SRIOV_TOTAL_VF, MAX_VFS);
 
 	/* Num VFs - start with 0 */
-	*(u16 *)&cap[PCI_SRIOV_NUM_VF] = 0;
+	fake_cfg_write16(cap, PCI_SRIOV_NUM_VF, 0);
 
 	/* Function Dependency Link */
-	*(u16 *)&cap[PCI_SRIOV_FUNC_LINK] = 0;
+	fake_cfg_write16(cap, PCI_SRIOV_FUNC_LINK, 0);
 
 	/* First VF Offset - VF0 at devfn PF+1 */
-	*(u16 *)&cap[PCI_SRIOV_VF_OFFSET] = 1;
+	fake_cfg_write16(cap, PCI_SRIOV_VF_OFFSET, 1);
 
 	/* VF Stride - consecutive devfns */
-	*(u16 *)&cap[PCI_SRIOV_VF_STRIDE] = 1;
+	fake_cfg_write16(cap, PCI_SRIOV_VF_STRIDE, 1);
 
 	/* VF Device ID */
-	*(u16 *)&cap[PCI_SRIOV_VF_DID] = FAKE_PCI_VF_DEVICE_ID;
+	fake_cfg_write16(cap, PCI_SRIOV_VF_DID, FAKE_PCI_VF_DEVICE_ID);
 
 	/* Supported Page Sizes - 4KB */
-	*(u32 *)&cap[PCI_SRIOV_SUP_PGSIZE] = 1;
+	fake_cfg_write32(cap, PCI_SRIOV_SUP_PGSIZE, 1);
 
 	/* System Page Size - 4KB */
-	*(u32 *)&cap[PCI_SRIOV_SYS_PGSIZE] = 1;
+	fake_cfg_write32(cap, PCI_SRIOV_SYS_PGSIZE, 1);
 
 	/* VF BAR0 - 4KB MMIO */
-	*(u32 *)&cap[PCI_SRIOV_BAR] = PCI_BASE_ADDRESS_MEM_TYPE_32;
+	fake_cfg_write32(cap, PCI_SRIOV_BAR, PCI_BASE_ADDRESS_MEM_TYPE_32);
 }
 
 static void init_pf_config_space(struct fake_pci_device *dev)
@@ -475,21 +533,21 @@ static void init_pf_config_space(struct fake_pci_device *dev)
 	dev->is_vf = false;
 
 	/* Vendor ID and Device ID */
-	*(u16 *)&config[PCI_VENDOR_ID] = FAKE_PCI_VENDOR_ID;
-	*(u16 *)&config[PCI_DEVICE_ID] = FAKE_PCI_PF_DEVICE_ID;
+	fake_cfg_write16(config, PCI_VENDOR_ID, FAKE_PCI_VENDOR_ID);
+	fake_cfg_write16(config, PCI_DEVICE_ID, FAKE_PCI_PF_DEVICE_ID);
 
 	/* Command - respond to memory and I/O, allow bus mastering */
-	*(u16 *)&config[PCI_COMMAND] = PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
-				       PCI_COMMAND_MASTER;
+	fake_cfg_write16(config, PCI_COMMAND, PCI_COMMAND_IO |
+			  PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
 
 	/* Status - capabilities list */
-	*(u16 *)&config[PCI_STATUS] = PCI_STATUS_CAP_LIST;
+	fake_cfg_write16(config, PCI_STATUS, PCI_STATUS_CAP_LIST);
 
 	/* Revision ID */
 	config[PCI_REVISION_ID] = 0x01;
 
-	/* Class code - Serial controller */
-	fake_pci_set_class(config, FAKE_PCI_CLASS);
+	/* Class code - vendor-specific control function */
+	fake_pci_set_class(config, FAKE_PCI_VENDOR_CLASS);
 
 	/* Cache line size */
 	config[PCI_CACHE_LINE_SIZE] = 64 / 4;
@@ -498,12 +556,11 @@ static void init_pf_config_space(struct fake_pci_device *dev)
 	config[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_NORMAL | PCI_HEADER_TYPE_MFD;
 
 	/* BAR0 - 4KB 32-bit non-prefetchable MMIO */
-	*(u32 *)&config[PCI_BASE_ADDRESS_0] = PCI_BASE_ADDRESS_MEM_TYPE_32;
-	dev->bar0_saved = 0;
+	fake_cfg_write32(config, PCI_BASE_ADDRESS_0, PCI_BASE_ADDRESS_MEM_TYPE_32);
 
 	/* Subsystem Vendor ID and Subsystem ID */
-	*(u16 *)&config[PCI_SUBSYSTEM_VENDOR_ID] = FAKE_PCI_SUBSYS_VENDOR;
-	*(u16 *)&config[PCI_SUBSYSTEM_ID] = FAKE_PCI_SUBSYS_ID;
+	fake_cfg_write16(config, PCI_SUBSYSTEM_VENDOR_ID, FAKE_PCI_SUBSYS_VENDOR);
+	fake_cfg_write16(config, PCI_SUBSYSTEM_ID, FAKE_PCI_SUBSYS_ID);
 
 	/* Capabilities pointer */
 	config[PCI_CAPABILITY_LIST] = PCIE_CAP_OFFSET;
@@ -529,25 +586,26 @@ static void init_vf_config_space(struct fake_pci_device *dev, int vf_index)
 	dev->vf_index = vf_index;
 
 	/* Vendor ID and Device ID */
-	*(u16 *)&config[PCI_VENDOR_ID] = FAKE_PCI_VENDOR_ID;
-	*(u16 *)&config[PCI_DEVICE_ID] = FAKE_PCI_VF_DEVICE_ID;
+	fake_cfg_write16(config, PCI_VENDOR_ID, FAKE_PCI_VENDOR_ID);
+	fake_cfg_write16(config, PCI_DEVICE_ID, FAKE_PCI_VF_DEVICE_ID);
 
 	/* Command */
-	*(u16 *)&config[PCI_COMMAND] = PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
-				       PCI_COMMAND_MASTER;
+	fake_cfg_write16(config, PCI_COMMAND, PCI_COMMAND_IO |
+			  PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
 
 	/* Status - capabilities list */
-	*(u16 *)&config[PCI_STATUS] = PCI_STATUS_CAP_LIST;
+	fake_cfg_write16(config, PCI_STATUS, PCI_STATUS_CAP_LIST);
 
 	/* Revision ID */
 	config[PCI_REVISION_ID] = 0x01;
 
 	/*
 	 * Default VFs to vendor-specific class so 8250_pci does not bind before
-	 * the host-side sample loopback driver.  Set vf_serial_class=1 when
-	 * intentionally experimenting with 8250/VFIO guest-visible behavior.
+	 * the host-side sample loopback driver.  Set vf_serial_class=1 only when
+	 * intentionally experimenting with host-visible serial class behavior.
 	 */
-	fake_pci_set_class(config, vf_serial_class ? FAKE_PCI_CLASS : 0xff0000);
+	fake_pci_set_class(config, vf_serial_class ? FAKE_PCI_SERIAL_CLASS :
+			   FAKE_PCI_VENDOR_CLASS);
 
 	/* Cache line size */
 	config[PCI_CACHE_LINE_SIZE] = 64 / 4;
@@ -556,12 +614,11 @@ static void init_vf_config_space(struct fake_pci_device *dev, int vf_index)
 	config[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_NORMAL;
 
 	/* BAR0 - 4KB 32-bit non-prefetchable MMIO */
-	*(u32 *)&config[PCI_BASE_ADDRESS_0] = PCI_BASE_ADDRESS_MEM_TYPE_32;
-	dev->bar0_saved = 0;
+	fake_cfg_write32(config, PCI_BASE_ADDRESS_0, PCI_BASE_ADDRESS_MEM_TYPE_32);
 
 	/* Subsystem Vendor ID and Subsystem ID */
-	*(u16 *)&config[PCI_SUBSYSTEM_VENDOR_ID] = FAKE_PCI_SUBSYS_VENDOR;
-	*(u16 *)&config[PCI_SUBSYSTEM_ID] = FAKE_PCI_SUBSYS_ID;
+	fake_cfg_write16(config, PCI_SUBSYSTEM_VENDOR_ID, FAKE_PCI_SUBSYS_VENDOR);
+	fake_cfg_write16(config, PCI_SUBSYSTEM_ID, FAKE_PCI_SUBSYS_ID);
 
 	/* Capabilities pointer */
 	config[PCI_CAPABILITY_LIST] = PCIE_CAP_OFFSET;
@@ -625,10 +682,7 @@ static int fake_pci_read_config(struct pci_bus *bus, unsigned int devfn,
 		return PCIBIOS_BAD_REGISTER_NUMBER;
 	}
 
-	*val = 0;
-	memcpy(val, &dev->config_space[where], size);
-
-	return PCIBIOS_SUCCESSFUL;
+	return fake_cfg_read(dev->config_space, where, size, val);
 }
 
 static void handle_sriov_numvfs_write(struct fake_pci_host *host, u16 num_vfs);
@@ -660,43 +714,57 @@ static int fake_pci_write_config(struct pci_bus *bus, unsigned int devfn,
 
 	config = dev->config_space;
 
-	/* Handle BAR sizing */
-	if (where >= PCI_BASE_ADDRESS_0 && where < PCI_BASE_ADDRESS_5 + 4) {
+	/* Handle BAR sizing. */
+	if (size == 4 && where >= PCI_BASE_ADDRESS_0 &&
+	    where < PCI_BASE_ADDRESS_5 + 4) {
 		int bar_offset = where - PCI_BASE_ADDRESS_0;
 		int bar_num = bar_offset / 4;
 
 		if (bar_num == 0) {
-			if (val == 0xFFFFFFFF) {
-				/* BAR sizing - save current value and write size mask */
-				dev->bar0_saved = *(u32 *)&config[where];
-				*(u32 *)&config[where] = ~(BAR0_SIZE - 1) |
-							 PCI_BASE_ADDRESS_MEM_TYPE_32;
+			if (val == 0xffffffff) {
+				fake_cfg_write32(config, where,
+						 ~(BAR0_SIZE - 1) |
+						 PCI_BASE_ADDRESS_MEM_TYPE_32);
 				return PCIBIOS_SUCCESSFUL;
 			}
-			/* Restore or set new BAR value */
-			*(u32 *)&config[where] = (val & ~(BAR0_SIZE - 1)) |
-						 PCI_BASE_ADDRESS_MEM_TYPE_32;
+
+			fake_cfg_write32(config, where,
+					 (val & ~(BAR0_SIZE - 1)) |
+					 PCI_BASE_ADDRESS_MEM_TYPE_32);
 			return PCIBIOS_SUCCESSFUL;
 		}
+
+		/* BAR1-BAR5 are not implemented. */
+		fake_cfg_write32(config, where, 0);
+		return PCIBIOS_SUCCESSFUL;
+	}
+
+	/* No expansion ROM is implemented. */
+	if (size == 4 && where == PCI_ROM_ADDRESS) {
+		fake_cfg_write32(config, PCI_ROM_ADDRESS, 0);
+		return PCIBIOS_SUCCESSFUL;
 	}
 
 	/* Handle PF SR-IOV VF BAR sizing/assignment. */
-	if (!dev->is_vf && where >= SRIOV_CAP_OFFSET + PCI_SRIOV_BAR &&
+	if (size == 4 && !dev->is_vf &&
+	    where >= SRIOV_CAP_OFFSET + PCI_SRIOV_BAR &&
 	    where < SRIOV_CAP_OFFSET + PCI_SRIOV_BAR +
 		    PCI_SRIOV_NUM_BARS * 4) {
 		int vf_bar = (where - (SRIOV_CAP_OFFSET + PCI_SRIOV_BAR)) / 4;
 
 		if (vf_bar == 0) {
 			if (val == 0xffffffff) {
-				*(u32 *)&config[where] = ~(BAR0_SIZE - 1) |
-							 PCI_BASE_ADDRESS_MEM_TYPE_32;
+				fake_cfg_write32(config, where,
+						 ~(BAR0_SIZE - 1) |
+						 PCI_BASE_ADDRESS_MEM_TYPE_32);
 				return PCIBIOS_SUCCESSFUL;
 			}
 
-			*(u32 *)&config[where] = (val & ~(BAR0_SIZE - 1)) |
-						 PCI_BASE_ADDRESS_MEM_TYPE_32;
+			fake_cfg_write32(config, where,
+					 (val & ~(BAR0_SIZE - 1)) |
+					 PCI_BASE_ADDRESS_MEM_TYPE_32);
 		} else {
-			*(u32 *)&config[where] = 0;
+			fake_cfg_write32(config, where, 0);
 		}
 
 		return PCIBIOS_SUCCESSFUL;
@@ -707,10 +775,8 @@ static int fake_pci_write_config(struct pci_bus *bus, unsigned int devfn,
 	 * or rescan VFs from config write callbacks: the PF driver's
 	 * .sriov_configure path below decides when VFs should become visible.
 	 */
-	if (!dev->is_vf && fake_pci_is_sriov_cfg(where)) {
-		memcpy(&config[where], &val, size);
-		return PCIBIOS_SUCCESSFUL;
-	}
+	if (!dev->is_vf && fake_pci_is_sriov_cfg(where))
+		return fake_cfg_write(config, where, size, val);
 
 	/* Write to read-only registers is ignored */
 	switch (where) {
@@ -727,9 +793,7 @@ static int fake_pci_write_config(struct pci_bus *bus, unsigned int devfn,
 	}
 
 	/* Default: write to config space */
-	memcpy(&config[where], &val, size);
-
-	return PCIBIOS_SUCCESSFUL;
+	return fake_cfg_write(config, where, size, val);
 }
 
 static struct pci_ops fake_pci_ops = {
@@ -771,7 +835,7 @@ static void handle_sriov_numvfs_write(struct fake_pci_host *host, u16 num_vfs)
 	host->num_vfs_enabled = num_vfs;
 
 	/* Update NumVF in PF config space */
-	*(u16 *)&pf_config[SRIOV_CAP_OFFSET + PCI_SRIOV_NUM_VF] = num_vfs;
+	fake_cfg_write16(pf_config, SRIOV_CAP_OFFSET + PCI_SRIOV_NUM_VF, num_vfs);
 
 	mutex_unlock(&host->lock);
 }
@@ -1536,7 +1600,7 @@ static ssize_t pci_sim_vfio_read_config(struct vfio_device *core_vdev,
 					   &val16, sizeof(val16)))
 		return -EFAULT;
 
-	val32 = cpu_to_le32(FAKE_PCI_CLASS << 8);
+	val32 = cpu_to_le32(FAKE_PCI_SERIAL_CLASS << 8);
 	if (pci_sim_vfio_copy_config_value(buf, pos, done, PCI_CLASS_REVISION,
 					   &val32, sizeof(val32)))
 		return -EFAULT;

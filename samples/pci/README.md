@@ -67,14 +67,19 @@ make -C /path/to/build \
   modules
 ```
 
-Required kernel options include PCI, IOMMU API, TTY, and VFIO PCI core support.
-The sample Kconfig dependency is `PCI && IOMMU_API && VFIO_PCI_CORE`.
+Required kernel options include x86 PCI, IOMMU API, TTY, and VFIO PCI core
+support.  The sample Kconfig dependency is
+`X86 && PCI && IOMMU_API && VFIO_PCI_CORE && TTY`.  The current implementation
+uses x86 PCI host bridge plumbing; a generic/aarch64-friendly refactor is a
+planned cleanup.
 
 ## Module parameters
 
-- `vf_serial_class` (bool, default `false`): expose VFs with PCI serial class
-  code instead of a vendor-specific class.  Nova/libvirt/QEMU tests usually use
-  `vf_serial_class=1`.
+- `vf_serial_class` (bool, default `false`): expose host-visible VFs with PCI
+  serial class code instead of a vendor-specific class.  This is useful for
+  host-side development experiments, but normal VFIO guest tests do not require
+  it because `vfio_guest_8250_compat=1` controls the guest-visible serial
+  identity independently.
 - `vfio_guest_8250_compat` (bool, default `true`): expose VFIO-assigned VFs to
   guests as an SGI IOC3/8250-compatible serial device.  Host-visible IDs do not
   change.
@@ -91,7 +96,7 @@ The sample Kconfig dependency is `PCI && IOMMU_API && VFIO_PCI_CORE`.
 
 ```sh
 sudo modprobe vfio-pci
-sudo insmod samples/pci/fake_pci_sriov.ko vf_serial_class=1
+sudo insmod samples/pci/fake_pci_sriov.ko
 ```
 
 The module also registers a host-side loopback driver.  If the new VF binds to
@@ -139,7 +144,6 @@ The canonical end-to-end test is:
 
 ```sh
 env IMAGE=/tmp/cirros-0.6.3-x86_64-disk.img \
-  MODULE_ARGS='vf_serial_class=1' \
   samples/pci/run_cirros_vfio_userdata_echo.sh
 ```
 
@@ -209,7 +213,7 @@ PY
 Use `num_pfs` to create more than one independent fake SR-IOV parent:
 
 ```sh
-sudo insmod samples/pci/fake_pci_sriov.ko num_pfs=2 vf_serial_class=1
+sudo insmod samples/pci/fake_pci_sriov.ko num_pfs=2
 ```
 
 Expected host topology:
@@ -239,7 +243,7 @@ samples/pci/run_fake_pci_multi_pf_smoke.sh
 |----------|----------|----------|
 | Vendor ID | `0x1d55` | `0x1d55` |
 | Device ID | `0x1000` | `0x1001` |
-| Host-visible default class | Serial controller (`0x070002`) | Vendor-specific (`0xff0000`) |
+| Host-visible default class | Vendor-specific (`0xff0000`) | Vendor-specific (`0xff0000`) |
 | Optional host-visible VF class | N/A | Serial controller (`0x070002`) with `vf_serial_class=1` |
 | VFIO guest-compatible identity | N/A | SGI IOC3 serial (`10a9:0003`) when `vfio_guest_8250_compat=1` |
 | BAR0 | 4 KiB host-visible MMIO resource | 4 KiB host-visible MMIO resource |

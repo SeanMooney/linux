@@ -5,7 +5,7 @@
 set -euo pipefail
 
 MODULE=${MODULE:-samples/pci/fake_pci_sriov.ko}
-MODULE_ARGS=${MODULE_ARGS:-vf_serial_class=1}
+MODULE_ARGS=${MODULE_ARGS:-}
 RELOAD_MODULE=${RELOAD_MODULE:-1}
 IMAGE=${IMAGE:-/tmp/cirros-0.6.3-x86_64-disk.img}
 IMAGE_URL=${IMAGE_URL:-https://github.com/cirros-dev/cirros/releases/download/0.6.3/cirros-0.6.3-x86_64-disk.img}
