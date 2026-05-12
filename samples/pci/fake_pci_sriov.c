@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Fake PCI Host Controller with Software IOMMU for SR-IOV Testing
+ * Fake PCI SR-IOV VFIO test fixture
  *
- * Creates a virtual PCI bus with emulated SR-IOV serial devices that can be
- * assigned to VMs via VFIO. Includes a software IOMMU driver that provides
- * proper IOMMU groups for device passthrough.
+ * This sample creates a fake PCI host bridge with one physical function (PF)
+ * and software-created virtual functions (VFs).  It is intended for SR-IOV
+ * control-plane testing, especially libvirt/QEMU device assignment flows used
+ * by OpenStack Nova, on systems without physical SR-IOV hardware.
+ *
+ * The VFs can be bound to the override-only pci_sim_vfio_pci driver below and
+ * assigned to a guest with QEMU's vfio-pci device.  The VFIO backend emulates
+ * BAR0 accesses in software and exposes a small 16550-style UART loopback
+ * payload so a guest can prove that the assigned VF is usable.
  */
 
 #include <linux/module.h>
@@ -25,7 +31,10 @@
 #include <linux/vfio_pci_core.h>
 #include <asm/pci.h>
 
-/* Device identification: use local experimental IDs to avoid QEMU collisions. */
+/*
+ * Host-visible device identification.  These local experimental IDs are what
+ * host tools such as Nova/libvirt see when discovering the fake PF/VFs.
+ */
 #define FAKE_PCI_VENDOR_ID	0x1d55
 #define FAKE_PCI_PF_DEVICE_ID	0x1000	/* PF device ID */
 #define FAKE_PCI_VF_DEVICE_ID	0x1001	/* VF device ID */
@@ -40,7 +49,7 @@
 
 /* BAR configuration */
 #define BAR0_SIZE		0x1000	/* 4KB host-visible MMIO region */
-#define PCI_SIM_VFIO_BAR0_SIZE	0x40000	/* Guest VFIO UART compatibility window */
+#define PCI_SIM_VFIO_BAR0_SIZE	0x40000	/* Guest SGI IOC3 window size */
 #define PCI_SIM_SGI_IOC3_UART_OFFSET 0x20178
 
 /* Host-side VF TTY loopback configuration */
@@ -52,12 +61,12 @@
 static bool vf_serial_class;
 module_param(vf_serial_class, bool, 0644);
 MODULE_PARM_DESC(vf_serial_class,
-		 "Expose VFs as PCI serial/16550 class devices instead of vendor-specific");
+		 "Expose host-visible VFs as PCI serial/16550 class devices instead of vendor-specific");
 
 static bool vfio_guest_8250_compat = true;
 module_param(vfio_guest_8250_compat, bool, 0644);
 MODULE_PARM_DESC(vfio_guest_8250_compat,
-		 "Expose VFIO-assigned VFs to guests as an 8250_pci-compatible SGI IOC3 serial device");
+		 "Overlay VFIO guest config space with an 8250_pci-compatible SGI IOC3 serial identity");
 
 static bool vfio_uart_trace;
 module_param(vfio_uart_trace, bool, 0644);
