@@ -168,6 +168,8 @@ Additional helper scripts are kept for narrower debugging:
 - `run_fake_pci_multi_pf_smoke.sh`: host-side smoke test for `num_pfs` and
   independent VF creation/removal across PFs.
 - `test_pci_sim_loopback.py`: host-side `/dev/ttyPCI_SIM*` loopback smoke test.
+- `cleanup_fake_pci_sriov.sh`: best-effort cleanup helper that unbinds fake
+  VFs, disables SR-IOV on fake PFs, removes fake PFs, and unloads the module.
 
 ## Limitations
 
@@ -266,14 +268,29 @@ VFIO PCI core support.
 
 ### `rmmod` reports the module is in use
 
-Remove fake PFs first, then unload the module:
+The fake PCI drivers bind to devices created by the same module, so remove the
+fake devices first, then unload the module.  The cleanup helper performs the
+usual sequence:
 
 ```sh
+samples/pci/cleanup_fake_pci_sriov.sh
+```
+
+Equivalent manual cleanup:
+
+```sh
+for vf in /sys/bus/pci/devices/*; do
+  [ "$(cat $vf/vendor 2>/dev/null)" = 0x1d55 ] || continue
+  [ "$(cat $vf/device 2>/dev/null)" = 0x1001 ] || continue
+  [ -e "$vf/driver/unbind" ] && echo "$(basename $vf)" | \
+    sudo tee "$vf/driver/unbind" >/dev/null || true
+  echo '' | sudo tee "$vf/driver_override" >/dev/null || true
+done
 for pf in /sys/bus/pci/devices/*; do
   [ "$(cat $pf/vendor 2>/dev/null)" = 0x1d55 ] || continue
   [ "$(cat $pf/device 2>/dev/null)" = 0x1000 ] || continue
-  echo 0 | sudo tee $pf/sriov_numvfs >/dev/null || true
-  echo 1 | sudo tee $pf/remove >/dev/null || true
+  echo 0 | sudo tee "$pf/sriov_numvfs" >/dev/null || true
+  echo 1 | sudo tee "$pf/remove" >/dev/null || true
 done
 sudo rmmod fake_pci_sriov
 ```
