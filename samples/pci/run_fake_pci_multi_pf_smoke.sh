@@ -9,6 +9,8 @@ VENDOR=${VENDOR:-0x1d55}
 PF_DEVICE=${PF_DEVICE:-0x1000}
 VF_DEVICE=${VF_DEVICE:-0x1001}
 EXPECT_PFS=${EXPECT_PFS:-2}
+EXPECT_PF_CLASS=${EXPECT_PF_CLASS:-0xff0000}
+EXPECT_VF_CLASS=${EXPECT_VF_CLASS:-0xff0000}
 LOG=${LOG:-/tmp/fake_pci_multi_pf_smoke.log}
 
 : > "$LOG"
@@ -28,30 +30,41 @@ find_fake_devs() {
 cleanup() {
 	set +e
 	msg cleanup
-	for pf in $(find_fake_devs "$PF_DEVICE"); do
-		[ -e "/sys/bus/pci/devices/$pf/sriov_numvfs" ] && \
-			echo 0 | sudo -n tee "/sys/bus/pci/devices/$pf/sriov_numvfs" >/dev/null
-	done
-	for pf in $(find_fake_devs "$PF_DEVICE"); do
-		[ -e "/sys/bus/pci/devices/$pf/remove" ] && \
-			echo 1 | sudo -n tee "/sys/bus/pci/devices/$pf/remove" >/dev/null
-	done
-	if grep -q '^fake_pci_sriov ' /proc/modules; then
-		sudo -n rmmod fake_pci_sriov || true
-	fi
+	LOG=/tmp/fake_pci_multi_pf_cleanup.log \
+		samples/pci/cleanup_fake_pci_sriov.sh || true
 	msg "log saved to $LOG"
 }
 trap cleanup EXIT
 
+assert_class() {
+	local dev=$1 expected=$2 class
+
+	class=$(cat "/sys/bus/pci/devices/$dev/class")
+	echo "DEV=$dev CLASS=$class EXPECT_CLASS=$expected"
+	[ "$class" = "$expected" ] || {
+		echo "FAIL: $dev class $class, expected $expected"
+		exit 1
+	}
+}
+
+assert_no_rom() {
+	local dev=$1
+
+	if lspci -D -s "$dev" -vv | grep -qi 'Expansion ROM'; then
+		echo "FAIL: $dev unexpectedly has an expansion ROM resource"
+		lspci -D -s "$dev" -vv
+		exit 1
+	fi
+}
+
 cd "$(dirname "$0")/../.."
+command -v lspci >/dev/null
 sudo -n true
 
-if grep -q '^fake_pci_sriov ' /proc/modules; then
-	for pf in $(find_fake_devs "$PF_DEVICE"); do
-		echo 0 | sudo -n tee "/sys/bus/pci/devices/$pf/sriov_numvfs" >/dev/null || true
-		echo 1 | sudo -n tee "/sys/bus/pci/devices/$pf/remove" >/dev/null || true
-	done
-	sudo -n rmmod fake_pci_sriov || true
+if grep -q '^fake_pci_sriov ' /proc/modules ||
+   [ -n "$(find_fake_devs "$PF_DEVICE")$(find_fake_devs "$VF_DEVICE")" ]; then
+	LOG=/tmp/fake_pci_multi_pf_pre_cleanup.log \
+		samples/pci/cleanup_fake_pci_sriov.sh || true
 fi
 
 msg "insmod $MODULE $MODULE_ARGS"
@@ -67,6 +80,11 @@ printf 'PF_LIST=%s\n' "${pfs[*]}"
 }
 
 for pf in "${pfs[@]}"; do
+	assert_class "$pf" "$EXPECT_PF_CLASS"
+	assert_no_rom "$pf"
+done
+
+for pf in "${pfs[@]}"; do
 	msg "enable VF on PF=$pf"
 	echo 1 | sudo -n tee "/sys/bus/pci/devices/$pf/sriov_numvfs" >/dev/null
 done
@@ -79,10 +97,22 @@ printf 'VF_LIST=%s\n' "${vfs[*]}"
 	exit 1
 }
 
+for vf in "${vfs[@]}"; do
+	assert_class "$vf" "$EXPECT_VF_CLASS"
+	assert_no_rom "$vf"
+done
+
 for dev in "${pfs[@]}" "${vfs[@]}"; do
-	driver=$(basename "$(readlink -f "/sys/bus/pci/devices/$dev/driver" 2>/dev/null)" 2>/dev/null || true)
-	group=$(basename "$(readlink -f "/sys/bus/pci/devices/$dev/iommu_group" 2>/dev/null)" 2>/dev/null || true)
+	dev_path=/sys/bus/pci/devices/$dev
+	driver=$(basename "$(readlink -f "$dev_path/driver" 2>/dev/null)" \
+		2>/dev/null || true)
+	group=$(basename "$(readlink -f "$dev_path/iommu_group" 2>/dev/null)" \
+		2>/dev/null || true)
 	echo "DEV=$dev DRIVER=$driver IOMMU_GROUP=$group"
+	[ -n "$group" ] || {
+		echo "FAIL: $dev has no IOMMU group"
+		exit 1
+	}
 done
 
 for pf in "${pfs[@]}"; do
@@ -97,4 +127,19 @@ printf 'VF_LIST_AFTER_DISABLE=%s\n' "${vfs_after[*]:-}"
 	exit 1
 }
 
+msg "cleanup helper"
+LOG=/tmp/fake_pci_multi_pf_final_cleanup.log \
+	samples/pci/cleanup_fake_pci_sriov.sh
+
+[ -z "$(find_fake_devs "$PF_DEVICE")$(find_fake_devs "$VF_DEVICE")" ] || {
+	echo "FAIL: fake devices remain after cleanup"
+	exit 1
+}
+! grep -q '^fake_pci_sriov ' /proc/modules || {
+	echo "FAIL: fake_pci_sriov remains loaded after cleanup"
+	exit 1
+}
+
+trap - EXIT
+msg "log saved to $LOG"
 msg PASS

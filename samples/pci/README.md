@@ -232,8 +232,10 @@ echo 1 | sudo tee /sys/bus/pci/devices/0001:00:00.0/sriov_numvfs
 echo 1 | sudo tee /sys/bus/pci/devices/0002:00:00.0/sriov_numvfs
 ```
 
-The host-side multi-PF smoke test loads `num_pfs=2`, enables one VF on each PF,
-checks independent IOMMU groups, disables the VFs, and unloads the module:
+The host-side multi-PF smoke test loads `num_pfs=2`, checks PF/VF classes and
+absence of expansion ROM resources, enables one VF on each PF, checks
+independent IOMMU groups, disables the VFs, exercises the cleanup helper, and
+unloads the module:
 
 ```sh
 samples/pci/run_fake_pci_multi_pf_smoke.sh
