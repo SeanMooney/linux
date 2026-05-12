@@ -67,11 +67,9 @@ make -C /path/to/build \
   modules
 ```
 
-Required kernel options include x86 PCI, IOMMU API, TTY, and VFIO PCI core
-support.  The sample Kconfig dependency is
-`X86 && PCI && IOMMU_API && VFIO_PCI_CORE && TTY`.  The current implementation
-uses x86 PCI host bridge plumbing; a generic/aarch64-friendly refactor is a
-planned cleanup.
+Required kernel options include PCI domain support, IOMMU API, TTY, and VFIO
+PCI core support.  The sample Kconfig dependency is
+`PCI && PCI_DOMAINS && IOMMU_API && VFIO_PCI_CORE && TTY`.
 
 ## Module parameters
 

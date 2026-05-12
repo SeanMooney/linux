@@ -31,7 +31,11 @@
 #include <linux/vfio_pci_core.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+#ifdef CONFIG_X86
 #include <asm/pci.h>
+#elif defined(CONFIG_ACPI)
+#include <linux/pci-ecam.h>
+#endif
 
 /*
  * Host-visible device identification.  These local experimental IDs are what
@@ -109,7 +113,11 @@ struct fake_pci_host {
 	struct list_head list;
 	struct pci_host_bridge *bridge;
 	struct platform_device *pdev;
+#ifdef CONFIG_X86
 	struct pci_sysdata sysdata;
+#elif defined(CONFIG_ACPI)
+	struct pci_config_window sysdata;
+#endif
 	struct resource bus_resource;
 	struct resource mem_resource;
 	struct fake_pci_device pf;
@@ -214,6 +222,46 @@ static int fake_cfg_write(u8 *config, int where, int size, u32 val)
 	default:
 		return PCIBIOS_BAD_REGISTER_NUMBER;
 	}
+}
+
+static struct fake_pci_host *fake_pci_host_from_domain(int domain)
+{
+	struct fake_pci_host *host;
+
+	lockdep_assert_held(&fake_hosts_lock);
+
+	list_for_each_entry(host, &fake_hosts, list) {
+		if (domain == host->domain_nr)
+			return host;
+	}
+
+	return NULL;
+}
+
+static void *fake_pci_host_sysdata(struct fake_pci_host *host)
+{
+#ifdef CONFIG_X86
+	return &host->sysdata;
+#elif defined(CONFIG_ACPI)
+	return &host->sysdata;
+#else
+	return NULL;
+#endif
+}
+
+static void fake_pci_host_init_sysdata(struct fake_pci_host *host)
+{
+#ifdef CONFIG_X86
+	host->sysdata.domain = host->domain_nr;
+	host->sysdata.node = NUMA_NO_NODE;
+#elif defined(CONFIG_ACPI)
+	/*
+	 * ACPI pcibios_root_bridge_prepare() expects ECAM-style sysdata on
+	 * ACPI-enabled platforms.  The fake pci_ops below do not use it, but a
+	 * zeroed window with no parent is enough for the ACPI root-bridge setup.
+	 */
+	host->sysdata.priv = host;
+#endif
 }
 
 struct fake_iommu_domain {
@@ -661,9 +709,9 @@ static struct fake_pci_device *get_fake_device(struct fake_pci_host *host,
 static int fake_pci_read_config(struct pci_bus *bus, unsigned int devfn,
 				int where, int size, u32 *val)
 {
-	struct fake_pci_host *host = container_of(bus->sysdata,
-							 struct fake_pci_host, sysdata);
+	struct fake_pci_host *host;
 	struct fake_pci_device *dev;
+	int ret;
 
 	/* Only bus 0 has devices */
 	if (bus->number != 0) {
@@ -671,18 +719,30 @@ static int fake_pci_read_config(struct pci_bus *bus, unsigned int devfn,
 		return PCIBIOS_DEVICE_NOT_FOUND;
 	}
 
+	mutex_lock(&fake_hosts_lock);
+	host = fake_pci_host_from_domain(pci_domain_nr(bus));
+	if (!host) {
+		mutex_unlock(&fake_hosts_lock);
+		*val = ~0;
+		return PCIBIOS_DEVICE_NOT_FOUND;
+	}
+
 	dev = get_fake_device(host, devfn);
 	if (!dev || !dev->present) {
+		mutex_unlock(&fake_hosts_lock);
 		*val = ~0;
 		return PCIBIOS_DEVICE_NOT_FOUND;
 	}
 
 	if (where + size > sizeof(dev->config_space)) {
+		mutex_unlock(&fake_hosts_lock);
 		*val = ~0;
 		return PCIBIOS_BAD_REGISTER_NUMBER;
 	}
 
-	return fake_cfg_read(dev->config_space, where, size, val);
+	ret = fake_cfg_read(dev->config_space, where, size, val);
+	mutex_unlock(&fake_hosts_lock);
+	return ret;
 }
 
 static void handle_sriov_numvfs_write(struct fake_pci_host *host, u16 num_vfs);
@@ -697,20 +757,31 @@ static bool fake_pci_is_sriov_cfg(int where)
 static int fake_pci_write_config(struct pci_bus *bus, unsigned int devfn,
 				 int where, int size, u32 val)
 {
-	struct fake_pci_host *host = container_of(bus->sysdata,
-							 struct fake_pci_host, sysdata);
+	struct fake_pci_host *host;
 	struct fake_pci_device *dev;
 	u8 *config;
+	int ret;
 
 	if (bus->number != 0)
 		return PCIBIOS_DEVICE_NOT_FOUND;
 
-	dev = get_fake_device(host, devfn);
-	if (!dev || !dev->present)
-		return PCIBIOS_DEVICE_NOT_FOUND;
+	mutex_lock(&fake_hosts_lock);
+	host = fake_pci_host_from_domain(pci_domain_nr(bus));
+	if (!host) {
+		ret = PCIBIOS_DEVICE_NOT_FOUND;
+		goto out_unlock;
+	}
 
-	if (where + size > sizeof(dev->config_space))
-		return PCIBIOS_BAD_REGISTER_NUMBER;
+	dev = get_fake_device(host, devfn);
+	if (!dev || !dev->present) {
+		ret = PCIBIOS_DEVICE_NOT_FOUND;
+		goto out_unlock;
+	}
+
+	if (where + size > sizeof(dev->config_space)) {
+		ret = PCIBIOS_BAD_REGISTER_NUMBER;
+		goto out_unlock;
+	}
 
 	config = dev->config_space;
 
@@ -725,24 +796,28 @@ static int fake_pci_write_config(struct pci_bus *bus, unsigned int devfn,
 				fake_cfg_write32(config, where,
 						 ~(BAR0_SIZE - 1) |
 						 PCI_BASE_ADDRESS_MEM_TYPE_32);
-				return PCIBIOS_SUCCESSFUL;
+				ret = PCIBIOS_SUCCESSFUL;
+				goto out_unlock;
 			}
 
 			fake_cfg_write32(config, where,
 					 (val & ~(BAR0_SIZE - 1)) |
 					 PCI_BASE_ADDRESS_MEM_TYPE_32);
-			return PCIBIOS_SUCCESSFUL;
+			ret = PCIBIOS_SUCCESSFUL;
+			goto out_unlock;
 		}
 
 		/* BAR1-BAR5 are not implemented. */
 		fake_cfg_write32(config, where, 0);
-		return PCIBIOS_SUCCESSFUL;
+		ret = PCIBIOS_SUCCESSFUL;
+		goto out_unlock;
 	}
 
 	/* No expansion ROM is implemented. */
 	if (size == 4 && where == PCI_ROM_ADDRESS) {
 		fake_cfg_write32(config, PCI_ROM_ADDRESS, 0);
-		return PCIBIOS_SUCCESSFUL;
+		ret = PCIBIOS_SUCCESSFUL;
+		goto out_unlock;
 	}
 
 	/* Handle PF SR-IOV VF BAR sizing/assignment. */
@@ -757,7 +832,8 @@ static int fake_pci_write_config(struct pci_bus *bus, unsigned int devfn,
 				fake_cfg_write32(config, where,
 						 ~(BAR0_SIZE - 1) |
 						 PCI_BASE_ADDRESS_MEM_TYPE_32);
-				return PCIBIOS_SUCCESSFUL;
+				ret = PCIBIOS_SUCCESSFUL;
+				goto out_unlock;
 			}
 
 			fake_cfg_write32(config, where,
@@ -767,7 +843,8 @@ static int fake_pci_write_config(struct pci_bus *bus, unsigned int devfn,
 			fake_cfg_write32(config, where, 0);
 		}
 
-		return PCIBIOS_SUCCESSFUL;
+		ret = PCIBIOS_SUCCESSFUL;
+		goto out_unlock;
 	}
 
 	/*
@@ -775,8 +852,10 @@ static int fake_pci_write_config(struct pci_bus *bus, unsigned int devfn,
 	 * or rescan VFs from config write callbacks: the PF driver's
 	 * .sriov_configure path below decides when VFs should become visible.
 	 */
-	if (!dev->is_vf && fake_pci_is_sriov_cfg(where))
-		return fake_cfg_write(config, where, size, val);
+	if (!dev->is_vf && fake_pci_is_sriov_cfg(where)) {
+		ret = fake_cfg_write(config, where, size, val);
+		goto out_unlock;
+	}
 
 	/* Write to read-only registers is ignored */
 	switch (where) {
@@ -789,11 +868,16 @@ static int fake_pci_write_config(struct pci_bus *bus, unsigned int devfn,
 	case PCI_SUBSYSTEM_VENDOR_ID:
 	case PCI_SUBSYSTEM_ID:
 	case PCI_CAPABILITY_LIST:
-		return PCIBIOS_SUCCESSFUL;
+		ret = PCIBIOS_SUCCESSFUL;
+		goto out_unlock;
 	}
 
 	/* Default: write to config space */
-	return fake_cfg_write(config, where, size, val);
+	ret = fake_cfg_write(config, where, size, val);
+
+out_unlock:
+	mutex_unlock(&fake_hosts_lock);
+	return ret;
 }
 
 static struct pci_ops fake_pci_ops = {
@@ -849,18 +933,12 @@ static void handle_sriov_numvfs_write(struct fake_pci_host *host, u16 num_vfs)
 static struct fake_pci_host *fake_pci_host_from_pdev(struct pci_dev *pdev)
 {
 	struct fake_pci_host *host;
-	int domain = pci_domain_nr(pdev->bus);
 
 	mutex_lock(&fake_hosts_lock);
-	list_for_each_entry(host, &fake_hosts, list) {
-		if (domain == host->domain_nr) {
-			mutex_unlock(&fake_hosts_lock);
-			return host;
-		}
-	}
+	host = fake_pci_host_from_domain(pci_domain_nr(pdev->bus));
 	mutex_unlock(&fake_hosts_lock);
 
-	return NULL;
+	return host;
 }
 
 static int fake_pci_pf_probe(struct pci_dev *pdev,
@@ -1831,8 +1909,7 @@ static int fake_pci_host_probe(struct fake_pci_host *host, unsigned int index)
 	 * domains that user space such as Nova cannot represent.
 	 */
 	host->domain_nr = index + 1;
-	host->sysdata.domain = host->domain_nr;
-	host->sysdata.node = NUMA_NO_NODE;
+	fake_pci_host_init_sysdata(host);
 
 	host->bus_resource.start = 0;
 	host->bus_resource.end = 0;
@@ -1863,7 +1940,7 @@ static int fake_pci_host_probe(struct fake_pci_host *host, unsigned int index)
 	host->bridge = bridge;
 
 	/* Set up the bridge */
-	bridge->sysdata = &host->sysdata;
+	bridge->sysdata = fake_pci_host_sysdata(host);
 	bridge->ops = &fake_pci_ops;
 	bridge->map_irq = fake_pci_map_irq;
 	bridge->busnr = 0;
@@ -1913,16 +1990,16 @@ static void fake_pci_host_remove(struct fake_pci_host *host)
 	if (!host)
 		return;
 
-	mutex_lock(&fake_hosts_lock);
-	list_del_init(&host->list);
-	mutex_unlock(&fake_hosts_lock);
-
 	if (host->bridge && host->bridge->bus) {
 		pci_lock_rescan_remove();
 		pci_stop_root_bus(host->bridge->bus);
 		pci_remove_root_bus(host->bridge->bus);
 		pci_unlock_rescan_remove();
 	}
+
+	mutex_lock(&fake_hosts_lock);
+	list_del_init(&host->list);
+	mutex_unlock(&fake_hosts_lock);
 
 	pdev = host->pdev;
 	mutex_destroy(&host->lock);
