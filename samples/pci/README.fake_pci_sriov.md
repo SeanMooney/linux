@@ -22,15 +22,37 @@ The sample contains four pieces:
 - **VFIO PCI backend**: `pci_sim_vfio_pci`, an override-only VFIO PCI driver for
   fake VFs.  It services trapped BAR0 reads/writes in software instead of
   relying on real host MMIO.
-- **UART loopback payload**: writes to the guest-visible UART transmit register
-  are queued into the receive FIFO, allowing guest tests to write and read back
-  bytes through the assigned VF.
+- **UART loopback payload**: writes to the UART transmit register are queued
+  into the receive FIFO, allowing tests to write and read back bytes through a
+  fake VF.
+- **Host tty frontend**: `pci_sim_loopback_vf` can bind to fake VFs on the host
+  and expose `/dev/ttyPCI_SIM*` loopback devices for local bring-up without
+  QEMU.
 
 Host-visible IDs remain the local experimental IDs.  When
 `vfio_guest_8250_compat=1` (the default), VFIO config-space reads presented to
 the guest are overlaid with an SGI IOC3 serial identity (`10a9:0003`).  This lets
 stock Linux guests bind `8250_pci` and create a `/dev/ttyS*` device without
 carrying a guest driver patch for the local fake IDs.
+
+## Design notes
+
+The fake PCI host emulates PCI config space through `pci_ops`, but ordinary BAR
+MMIO accesses do not flow through `pci_ops`.  Once the kernel assigns a BAR,
+drivers and VFIO treat it as a physical MMIO resource.  That is why fake VFs
+need `pci_sim_vfio_pci`: generic `vfio-pci` cannot service reads and writes to a
+purely software BAR.
+
+The UART behavior is intentionally minimal and is modeled after the loopback
+approach used by `samples/vfio-mdev/mtty.c`: TX writes feed an RX FIFO, `LSR`
+reports data-ready/transmitter-empty state, `FCR` can clear FIFOs, and `LCR`
+handles the divisor-latch bit.  The model is sufficient for polling-based
+`8250_pci` tests; it is not intended to be a complete serial-device emulator.
+
+The SGI IOC3 compatibility identity was chosen because Linux `8250_pci` has an
+explicit MMIO, no-IRQ board entry for it.  That avoids requiring an interrupt
+path or a guest kernel patch for `1d55:1001` while still proving VFIO assignment
+and BAR access from an unmodified guest.
 
 ## Build
 
@@ -88,6 +110,16 @@ echo $VF | sudo tee /sys/bus/pci/drivers_probe
 
 sudo qemu-system-x86_64 ... -device vfio-pci,host=$VF
 ```
+
+## Host-side tty loopback
+
+For local debugging without QEMU, bind a VF to `pci_sim_loopback_vf` instead of
+`pci_sim_vfio_pci`.  The driver creates `/dev/ttyPCI_SIM*` devices with
+independent FIFO state per VF.  Bytes written to one VF's tty can be read back
+from the same tty.
+
+This path is useful for validating VF creation/removal and UART FIFO lifetime
+rules before involving VFIO or a guest.
 
 ## Test scripts
 
