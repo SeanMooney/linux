@@ -2,7 +2,7 @@
 
 config SAMPLE_FAKE_PCI_SRIOV
 	tristate "Fake PCI Host Controller with SR-IOV for testing"
-	depends on PCI && IOMMU_API
+	depends on PCI && IOMMU_API && VFIO_PCI_CORE
 	help
 	  This builds a sample kernel module that creates a fake PCI host
 	  controller with SR-IOV capable devices. It includes a software

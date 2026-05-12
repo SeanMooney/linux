@@ -17,9 +17,12 @@
 #include <linux/slab.h>
 #include <linux/mutex.h>
 #include <linux/idr.h>
+#include <linux/xarray.h>
 #include <linux/serial_reg.h>
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
+#include <linux/uaccess.h>
+#include <linux/vfio_pci_core.h>
 #include <asm/pci.h>
 
 /* Device identification: use local experimental IDs to avoid QEMU collisions. */
@@ -36,7 +39,9 @@
 #define PCIE_CAP_OFFSET		0x40	/* PCIe capability offset */
 
 /* BAR configuration */
-#define BAR0_SIZE		0x1000	/* 4KB MMIO region */
+#define BAR0_SIZE		0x1000	/* 4KB host-visible MMIO region */
+#define PCI_SIM_VFIO_BAR0_SIZE	0x40000	/* Guest VFIO UART compatibility window */
+#define PCI_SIM_SGI_IOC3_UART_OFFSET 0x20178
 
 /* Host-side VF TTY loopback configuration */
 #define PCI_SIM_TTY_NAME	"ttyPCI_SIM"
@@ -48,6 +53,21 @@ static bool vf_serial_class;
 module_param(vf_serial_class, bool, 0644);
 MODULE_PARM_DESC(vf_serial_class,
 		 "Expose VFs as PCI serial/16550 class devices instead of vendor-specific");
+
+static bool vfio_guest_8250_compat = true;
+module_param(vfio_guest_8250_compat, bool, 0644);
+MODULE_PARM_DESC(vfio_guest_8250_compat,
+		 "Expose VFIO-assigned VFs to guests as an 8250_pci-compatible SGI IOC3 serial device");
+
+static bool vfio_uart_trace;
+module_param(vfio_uart_trace, bool, 0644);
+MODULE_PARM_DESC(vfio_uart_trace,
+		 "Trace VFIO BAR0 UART register accesses");
+
+static int fake_intx_irq;
+module_param(fake_intx_irq, int, 0644);
+MODULE_PARM_DESC(fake_intx_irq,
+		 "Optional host IRQ number to report for fake PCI INTx routing (0 disables)");
 
 /* Forward declarations */
 static struct fake_pci_host *fake_host;
@@ -100,6 +120,12 @@ struct pci_sim_vf_tty {
 	bool dead;
 };
 
+struct pci_sim_vfio_vf {
+	struct vfio_pci_core_device core;
+	struct mutex lock;
+	struct pci_sim_uart uart;
+};
+
 /*
  * ============================================================================
  * Software IOMMU Driver
@@ -122,14 +148,20 @@ static struct resource fake_pci_bus_resource = {
 };
 
 static struct resource fake_pci_mem_resource = {
-	.start	= 0x10000000,
-	.end	= 0x100fffff,
+	/*
+	 * Keep the fake PCI MMIO window out of System RAM.  VFIO reserves BARs
+	 * with request_mem_region() when servicing trapped BAR accesses; placing
+	 * this window inside RAM makes that reservation fail with -EBUSY.
+	 */
+	.start	= 0xd0000000,
+	.end	= 0xd00fffff,
 	.flags	= IORESOURCE_MEM,
 	.name	= "fake_pci_mem",
 };
 
 struct fake_iommu_domain {
 	struct iommu_domain domain;
+	struct xarray mappings;
 };
 
 static struct fake_iommu_domain *to_fake_domain(struct iommu_domain *dom)
@@ -158,6 +190,7 @@ static void fake_domain_free_paging(struct iommu_domain *domain)
 {
 	struct fake_iommu_domain *fake_dom = to_fake_domain(domain);
 
+	xa_destroy(&fake_dom->mappings);
 	kfree(fake_dom);
 }
 
@@ -166,9 +199,41 @@ static int fake_domain_map_pages(struct iommu_domain *domain,
 				 size_t pgsize, size_t pgcount, int prot,
 				 gfp_t gfp, size_t *mapped)
 {
-	/* Software IOMMU - accept all mappings */
-	*mapped = pgsize * pgcount;
+	struct fake_iommu_domain *fake_dom = to_fake_domain(domain);
+	unsigned long iova_pfn = iova >> PAGE_SHIFT;
+	unsigned long pfn = paddr >> PAGE_SHIFT;
+	size_t total = pgsize * pgcount;
+	size_t npages = total >> PAGE_SHIFT;
+	size_t i;
+	int ret;
+
+	*mapped = 0;
+
+	if (!IS_ALIGNED(iova, PAGE_SIZE) || !IS_ALIGNED(paddr, PAGE_SIZE) ||
+	    !IS_ALIGNED(total, PAGE_SIZE))
+		return -EINVAL;
+
+	for (i = 0; i < npages; i++) {
+		if (xa_load(&fake_dom->mappings, iova_pfn + i)) {
+			ret = -EBUSY;
+			goto err_unmap;
+		}
+
+		ret = xa_err(xa_store(&fake_dom->mappings, iova_pfn + i,
+					 xa_mk_value(pfn + i), gfp));
+		if (ret)
+			goto err_unmap;
+
+		*mapped += PAGE_SIZE;
+	}
+
 	return 0;
+
+err_unmap:
+	while (i--)
+		xa_erase(&fake_dom->mappings, iova_pfn + i);
+	*mapped = 0;
+	return ret;
 }
 
 static size_t fake_domain_unmap_pages(struct iommu_domain *domain,
@@ -176,14 +241,36 @@ static size_t fake_domain_unmap_pages(struct iommu_domain *domain,
 				      size_t pgcount,
 				      struct iommu_iotlb_gather *gather)
 {
-	return pgsize * pgcount;
+	struct fake_iommu_domain *fake_dom = to_fake_domain(domain);
+	unsigned long iova_pfn = iova >> PAGE_SHIFT;
+	size_t total = pgsize * pgcount;
+	size_t npages = total >> PAGE_SHIFT;
+	size_t unmapped = 0;
+
+	if (!IS_ALIGNED(iova, PAGE_SIZE) || !IS_ALIGNED(total, PAGE_SIZE))
+		return 0;
+
+	while (unmapped < npages) {
+		if (!xa_erase(&fake_dom->mappings, iova_pfn + unmapped))
+			break;
+		unmapped++;
+	}
+
+	return unmapped << PAGE_SHIFT;
 }
 
 static phys_addr_t fake_domain_iova_to_phys(struct iommu_domain *domain,
 					    dma_addr_t iova)
 {
-	/* Identity mapping for software IOMMU */
-	return iova;
+	struct fake_iommu_domain *fake_dom = to_fake_domain(domain);
+	void *entry;
+
+	entry = xa_load(&fake_dom->mappings, iova >> PAGE_SHIFT);
+	if (!entry || !xa_is_value(entry))
+		return 0;
+
+	return ((phys_addr_t)xa_to_value(entry) << PAGE_SHIFT) |
+	       (iova & ~PAGE_MASK);
 }
 
 static const struct iommu_domain_ops fake_paging_domain_ops = {
@@ -215,6 +302,7 @@ fake_domain_alloc_paging_flags(struct device *dev, u32 flags,
 	fake_dom->domain.geometry.aperture_start = 0;
 	fake_dom->domain.geometry.aperture_end = ~0UL;
 	fake_dom->domain.geometry.force_aperture = true;
+	xa_init(&fake_dom->mappings);
 
 	return &fake_dom->domain;
 }
@@ -294,10 +382,9 @@ static void init_pcie_capability(u8 *config, bool is_pf)
 	/* Next capability - SR-IOV for PF, none for VF */
 	cap[PCI_CAP_LIST_NEXT] = 0;
 
-	/* PCIe Capabilities Register */
-	/* Version 2, Endpoint type */
-	*(u16 *)&cap[PCI_EXP_FLAGS] = PCI_EXP_TYPE_ENDPOINT |
-				      (2 << 4); /* Version 2 */
+	/* PCIe Capabilities Register: version in bits 3:0, type in bits 7:4. */
+	*(u16 *)&cap[PCI_EXP_FLAGS] = 2 |
+				      (PCI_EXP_TYPE_ENDPOINT << 4);
 
 	/* Device Capabilities */
 	*(u32 *)&cap[PCI_EXP_DEVCAP] = PCI_EXP_DEVCAP_FLR;
@@ -858,6 +945,116 @@ static u8 pci_sim_uart_lsr(struct pci_sim_uart *uart)
 	return lsr;
 }
 
+static u8 pci_sim_uart_read_data(struct pci_sim_uart *uart)
+{
+	unsigned long flags;
+	u8 val = 0xff;
+
+	spin_lock_irqsave(&uart->lock, flags);
+	if (uart->count) {
+		val = uart->fifo[uart->tail];
+		uart->tail = (uart->tail + 1) % PCI_SIM_UART_FIFO_SIZE;
+		uart->count--;
+	}
+	spin_unlock_irqrestore(&uart->lock, flags);
+
+	return val;
+}
+
+static void pci_sim_uart_clear_fifo(struct pci_sim_uart *uart)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&uart->lock, flags);
+	uart->head = 0;
+	uart->tail = 0;
+	uart->count = 0;
+	uart->overrun = false;
+	spin_unlock_irqrestore(&uart->lock, flags);
+}
+
+static u8 pci_sim_uart_read_reg(struct pci_sim_uart *uart, u8 reg)
+{
+	reg &= 7;
+
+	if (uart->dlab) {
+		switch (reg) {
+		case UART_DLL:
+			return uart->divisor & 0xff;
+		case UART_DLM:
+			return uart->divisor >> 8;
+		}
+	}
+
+	switch (reg) {
+	case UART_RX:
+		return pci_sim_uart_read_data(uart);
+	case UART_IER:
+		return uart->regs[UART_IER];
+	case UART_IIR:
+		if ((uart->regs[UART_IER] & UART_IER_RDI) &&
+		    pci_sim_uart_chars_in_buffer(uart))
+			return UART_IIR_RDI;
+		if (uart->regs[UART_IER] & UART_IER_THRI)
+			return UART_IIR_THRI;
+		return UART_IIR_NO_INT;
+	case UART_LCR:
+		return uart->regs[UART_LCR];
+	case UART_MCR:
+		return uart->regs[UART_MCR];
+	case UART_LSR:
+		return pci_sim_uart_lsr(uart);
+	case UART_MSR:
+		return uart->regs[UART_MSR];
+	case UART_SCR:
+		return uart->regs[UART_SCR];
+	default:
+		return 0xff;
+	}
+}
+
+static void pci_sim_uart_write_reg(struct pci_sim_uart *uart, u8 reg, u8 val)
+{
+	reg &= 7;
+
+	if (uart->dlab) {
+		switch (reg) {
+		case UART_DLL:
+			uart->divisor = (uart->divisor & 0xff00) | val;
+			return;
+		case UART_DLM:
+			uart->divisor = (uart->divisor & 0x00ff) | (val << 8);
+			return;
+		}
+	}
+
+	switch (reg) {
+	case UART_TX:
+		pci_sim_uart_write_data(uart, &val, 1);
+		break;
+	case UART_IER:
+		uart->regs[UART_IER] = val;
+		break;
+	case UART_FCR:
+		uart->fcr = val;
+		if (val & UART_FCR_CLEAR_RCVR)
+			pci_sim_uart_clear_fifo(uart);
+		break;
+	case UART_LCR:
+		uart->regs[UART_LCR] = val;
+		uart->dlab = !!(val & UART_LCR_DLAB);
+		break;
+	case UART_MCR:
+		uart->regs[UART_MCR] = val;
+		break;
+	case UART_SCR:
+		uart->regs[UART_SCR] = val;
+		break;
+	default:
+		break;
+	}
+}
+
 static void pci_sim_vf_flush_to_tty(struct pci_sim_vf_tty *vf)
 {
 	u8 buf[PCI_SIM_UART_CHUNK];
@@ -1102,6 +1299,285 @@ static struct pci_driver pci_sim_vf_driver = {
 	.remove		= pci_sim_vf_remove,
 };
 
+/*
+ * VFIO-facing VF driver.
+ *
+ * Generic vfio-pci expects BAR0 to be backed by real host MMIO.  These fake
+ * VFs only exist behind fake pci_ops, so pci_iomap()/ioread() cannot service
+ * guest BAR accesses.  This override-only driver still exposes the device via
+ * VFIO, but traps BAR0 read/write and emulates a tiny 16550 loopback UART.
+ */
+static int pci_sim_vfio_open_device(struct vfio_device *core_vdev)
+{
+	struct pci_sim_vfio_vf *sim = container_of(core_vdev,
+			struct pci_sim_vfio_vf, core.vdev);
+	int ret;
+
+	ret = vfio_pci_core_enable(&sim->core);
+	if (ret)
+		return ret;
+
+	vfio_pci_core_finish_enable(&sim->core);
+	return 0;
+}
+
+static ssize_t pci_sim_vfio_bar0_rw(struct pci_sim_vfio_vf *sim,
+				    char __user *buf, size_t count,
+				    loff_t *ppos, bool iswrite)
+{
+	loff_t pos = *ppos & VFIO_PCI_OFFSET_MASK;
+	size_t done;
+	u8 val;
+
+	if (pos >= PCI_SIM_VFIO_BAR0_SIZE)
+		return -EINVAL;
+
+	count = min_t(size_t, count, PCI_SIM_VFIO_BAR0_SIZE - pos);
+
+	mutex_lock(&sim->lock);
+	for (done = 0; done < count; done++) {
+		if (iswrite) {
+			if (copy_from_user(&val, buf + done, 1)) {
+				mutex_unlock(&sim->lock);
+				return done ?: -EFAULT;
+			}
+			loff_t reg_pos = pos + done;
+
+			if (reg_pos >= PCI_SIM_SGI_IOC3_UART_OFFSET)
+				reg_pos -= PCI_SIM_SGI_IOC3_UART_OFFSET;
+			if (vfio_uart_trace)
+				pr_info("fake_pci: vfio uart W off=0x%llx reg=%u val=0x%02x\n",
+					(unsigned long long)(pos + done),
+					(unsigned int)(reg_pos & 7), val);
+			pci_sim_uart_write_reg(&sim->uart, reg_pos & 7, val);
+		} else {
+			loff_t reg_pos = pos + done;
+
+			if (reg_pos >= PCI_SIM_SGI_IOC3_UART_OFFSET)
+				reg_pos -= PCI_SIM_SGI_IOC3_UART_OFFSET;
+			val = pci_sim_uart_read_reg(&sim->uart, reg_pos & 7);
+			if (vfio_uart_trace)
+				pr_info("fake_pci: vfio uart R off=0x%llx reg=%u val=0x%02x\n",
+					(unsigned long long)(pos + done),
+					(unsigned int)(reg_pos & 7), val);
+			if (copy_to_user(buf + done, &val, 1)) {
+				mutex_unlock(&sim->lock);
+				return done ?: -EFAULT;
+			}
+		}
+	}
+	mutex_unlock(&sim->lock);
+
+	*ppos += done;
+	return done;
+}
+
+static int pci_sim_vfio_copy_config_value(char __user *buf,
+					  loff_t pos, size_t count,
+					  unsigned int reg, const void *val,
+					  size_t val_size)
+{
+	loff_t copy_offset;
+	size_t copy_count, register_offset;
+
+	if (!vfio_pci_core_range_intersect_range(pos, count, reg, val_size,
+					       &copy_offset, &copy_count,
+					       &register_offset))
+		return 0;
+
+	if (copy_to_user(buf + copy_offset, val + register_offset, copy_count))
+		return -EFAULT;
+
+	return 0;
+}
+
+static ssize_t pci_sim_vfio_read_config(struct vfio_device *core_vdev,
+					char __user *buf, size_t count,
+					loff_t *ppos)
+{
+	loff_t pos = *ppos & VFIO_PCI_OFFSET_MASK;
+	__le16 val16;
+	__le32 val32;
+	ssize_t ret;
+
+	ret = vfio_pci_core_read(core_vdev, buf, count, ppos);
+	if (ret < 0 || !vfio_guest_8250_compat)
+		return ret;
+
+	/*
+	 * The fake host keeps local experimental IDs (1d55:1001), but many guest
+	 * kernels only have an 8250_pci explicit table entry for known MMIO PCI
+	 * serial devices.  Present the SGI IOC3 serial ID through VFIO config
+	 * space because that 8250_pci entry is MMIO and polling/no-IRQ based.
+	 */
+	val16 = cpu_to_le16(PCI_VENDOR_ID_SGI);
+	if (pci_sim_vfio_copy_config_value(buf, pos, count, PCI_VENDOR_ID,
+					   &val16, sizeof(val16)))
+		return -EFAULT;
+
+	val16 = cpu_to_le16(PCI_DEVICE_ID_SGI_IOC3);
+	if (pci_sim_vfio_copy_config_value(buf, pos, count, PCI_DEVICE_ID,
+					   &val16, sizeof(val16)))
+		return -EFAULT;
+
+	val32 = cpu_to_le32(FAKE_PCI_CLASS << 8);
+	if (pci_sim_vfio_copy_config_value(buf, pos, count, PCI_CLASS_REVISION,
+					   &val32, sizeof(val32)))
+		return -EFAULT;
+
+	val16 = cpu_to_le16(0xff00);
+	if (pci_sim_vfio_copy_config_value(buf, pos, count,
+					   PCI_SUBSYSTEM_VENDOR_ID,
+					   &val16, sizeof(val16)))
+		return -EFAULT;
+
+	val16 = cpu_to_le16(0);
+	if (pci_sim_vfio_copy_config_value(buf, pos, count, PCI_SUBSYSTEM_ID,
+					   &val16, sizeof(val16)))
+		return -EFAULT;
+
+	return ret;
+}
+
+static ssize_t pci_sim_vfio_read(struct vfio_device *core_vdev,
+				 char __user *buf, size_t count, loff_t *ppos)
+{
+	struct pci_sim_vfio_vf *sim = container_of(core_vdev,
+			struct pci_sim_vfio_vf, core.vdev);
+	unsigned int index = VFIO_PCI_OFFSET_TO_INDEX(*ppos);
+
+	if (!count)
+		return 0;
+
+	if (index == VFIO_PCI_CONFIG_REGION_INDEX)
+		return pci_sim_vfio_read_config(core_vdev, buf, count, ppos);
+
+	if (index == VFIO_PCI_BAR0_REGION_INDEX)
+		return pci_sim_vfio_bar0_rw(sim, buf, count, ppos, false);
+
+	return vfio_pci_core_read(core_vdev, buf, count, ppos);
+}
+
+static ssize_t pci_sim_vfio_write(struct vfio_device *core_vdev,
+				  const char __user *buf, size_t count, loff_t *ppos)
+{
+	struct pci_sim_vfio_vf *sim = container_of(core_vdev,
+			struct pci_sim_vfio_vf, core.vdev);
+	unsigned int index = VFIO_PCI_OFFSET_TO_INDEX(*ppos);
+
+	if (!count)
+		return 0;
+
+	if (index == VFIO_PCI_BAR0_REGION_INDEX)
+		return pci_sim_vfio_bar0_rw(sim, (char __user *)buf, count,
+					       ppos, true);
+
+	return vfio_pci_core_write(core_vdev, buf, count, ppos);
+}
+
+static int pci_sim_vfio_get_region_info(struct vfio_device *core_vdev,
+					struct vfio_region_info *info,
+					struct vfio_info_cap *caps)
+{
+	if (info->index != VFIO_PCI_BAR0_REGION_INDEX)
+		return vfio_pci_ioctl_get_region_info(core_vdev, info, caps);
+
+	info->offset = VFIO_PCI_INDEX_TO_OFFSET(info->index);
+	info->size = vfio_guest_8250_compat ? PCI_SIM_VFIO_BAR0_SIZE : BAR0_SIZE;
+	info->flags = VFIO_REGION_INFO_FLAG_READ | VFIO_REGION_INFO_FLAG_WRITE;
+	return 0;
+}
+
+static int pci_sim_vfio_mmap(struct vfio_device *core_vdev,
+			     struct vm_area_struct *vma)
+{
+	unsigned int index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT);
+
+	if (index == VFIO_PCI_BAR0_REGION_INDEX)
+		return -EINVAL;
+
+	return vfio_pci_core_mmap(core_vdev, vma);
+}
+
+static const struct vfio_device_ops pci_sim_vfio_ops = {
+	.name		= "pci_sim_vfio_pci",
+	.init		= vfio_pci_core_init_dev,
+	.release	= vfio_pci_core_release_dev,
+	.open_device	= pci_sim_vfio_open_device,
+	.close_device	= vfio_pci_core_close_device,
+	.ioctl		= vfio_pci_core_ioctl,
+	.get_region_info_caps = pci_sim_vfio_get_region_info,
+	.device_feature = vfio_pci_core_ioctl_feature,
+	.read		= pci_sim_vfio_read,
+	.write		= pci_sim_vfio_write,
+	.mmap		= pci_sim_vfio_mmap,
+	.request	= vfio_pci_core_request,
+	.match		= vfio_pci_core_match,
+	.match_token_uuid = vfio_pci_core_match_token_uuid,
+	.bind_iommufd	= vfio_iommufd_physical_bind,
+	.unbind_iommufd	= vfio_iommufd_physical_unbind,
+	.attach_ioas	= vfio_iommufd_physical_attach_ioas,
+	.detach_ioas	= vfio_iommufd_physical_detach_ioas,
+	.pasid_attach_ioas = vfio_iommufd_physical_pasid_attach_ioas,
+	.pasid_detach_ioas = vfio_iommufd_physical_pasid_detach_ioas,
+};
+
+static int pci_sim_vfio_probe(struct pci_dev *pdev,
+			      const struct pci_device_id *id)
+{
+	struct pci_sim_vfio_vf *sim;
+	int ret;
+
+	sim = vfio_alloc_device(pci_sim_vfio_vf, core.vdev, &pdev->dev,
+					&pci_sim_vfio_ops);
+	if (IS_ERR(sim))
+		return PTR_ERR(sim);
+
+	mutex_init(&sim->lock);
+	pci_sim_uart_init(&sim->uart);
+	dev_set_drvdata(&pdev->dev, &sim->core);
+
+	ret = vfio_pci_core_register_device(&sim->core);
+	if (ret)
+		goto err_put;
+
+	pci_info(pdev, "registered VFIO UART BAR0 emulator\n");
+	return 0;
+
+err_put:
+	vfio_put_device(&sim->core.vdev);
+	return ret;
+}
+
+static void pci_sim_vfio_remove(struct pci_dev *pdev)
+{
+	struct vfio_pci_core_device *core = dev_get_drvdata(&pdev->dev);
+	struct pci_sim_vfio_vf *sim;
+
+	if (!core)
+		return;
+
+	sim = container_of(core, struct pci_sim_vfio_vf, core);
+	vfio_pci_core_unregister_device(&sim->core);
+	vfio_put_device(&sim->core.vdev);
+}
+
+static const struct pci_device_id pci_sim_vfio_ids[] = {
+	{ PCI_DRIVER_OVERRIDE_DEVICE_VFIO(FAKE_PCI_VENDOR_ID,
+					    FAKE_PCI_VF_DEVICE_ID) },
+	{ }
+};
+MODULE_DEVICE_TABLE(pci, pci_sim_vfio_ids);
+
+static struct pci_driver pci_sim_vfio_driver = {
+	.name			= "pci_sim_vfio_pci",
+	.id_table		= pci_sim_vfio_ids,
+	.probe			= pci_sim_vfio_probe,
+	.remove			= pci_sim_vfio_remove,
+	.err_handler		= &vfio_pci_core_err_handlers,
+	.driver_managed_dma	= true,
+};
+
 static int pci_sim_tty_register_driver(void)
 {
 	int ret;
@@ -1156,6 +1632,11 @@ static void fake_pci_release_host_bridge(struct pci_host_bridge *bridge)
 	pr_info("fake_pci: releasing host bridge\n");
 }
 
+static int fake_pci_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
+{
+	return fake_intx_irq ?: -1;
+}
+
 static int fake_pci_host_probe(void)
 {
 	struct pci_host_bridge *bridge;
@@ -1194,6 +1675,7 @@ static int fake_pci_host_probe(void)
 	/* Set up the bridge */
 	bridge->sysdata = &fake_host->sysdata;
 	bridge->ops = &fake_pci_ops;
+	bridge->map_irq = fake_pci_map_irq;
 	bridge->busnr = 0;
 	bridge->dev.parent = &fake_host->pdev->dev;
 
@@ -1297,10 +1779,16 @@ static int __init fake_pci_sriov_init(void)
 		goto err_iommu;
 	}
 
+	err = pci_register_driver(&pci_sim_vfio_driver);
+	if (err) {
+		pr_err("fake_pci: Failed to register VFIO UART driver: %d\n", err);
+		goto err_tty;
+	}
+
 	err = pci_register_driver(&pci_sim_vf_driver);
 	if (err) {
 		pr_err("fake_pci: Failed to register VF loopback driver: %d\n", err);
-		goto err_tty;
+		goto err_vfio_driver;
 	}
 
 	/* Register before host probe so our PF driver wins class-code races. */
@@ -1352,6 +1840,8 @@ err_pf_driver:
 	pci_unregister_driver(&fake_pci_pf_driver);
 err_vf_driver:
 	pci_unregister_driver(&pci_sim_vf_driver);
+err_vfio_driver:
+	pci_unregister_driver(&pci_sim_vfio_driver);
 err_tty:
 	pci_sim_tty_unregister_driver();
 err_iommu:
@@ -1378,6 +1868,7 @@ static void __exit fake_pci_sriov_exit(void)
 
 	pci_unregister_driver(&fake_pci_pf_driver);
 	pci_unregister_driver(&pci_sim_vf_driver);
+	pci_unregister_driver(&pci_sim_vfio_driver);
 	pci_sim_tty_unregister_driver();
 
 	/* Then remove IOMMU */
