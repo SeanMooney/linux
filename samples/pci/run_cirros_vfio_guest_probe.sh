@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
-# Boot CirrOS with fake_pci_sriov VF via VFIO and run guest-side probe commands.
+# Boot cirros with fake_pci_sriov VF via VFIO and run guest-side probe commands.
 set -euo pipefail
 
 MODULE=${MODULE:-samples/pci/fake_pci_sriov.ko}

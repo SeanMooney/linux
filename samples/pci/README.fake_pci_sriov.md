@@ -8,7 +8,7 @@ sample useful for OpenStack Nova/libvirt/QEMU SR-IOV testing.
 
 The emulated VF payload is intentionally small: a 16550-style UART loopback.
 It exists to prove that a VF assigned through VFIO is visible and usable inside
-a guest such as CirrOS.
+a guest such as cirros.
 
 ## Architecture
 
@@ -131,14 +131,14 @@ env IMAGE=/tmp/cirros-0.6.3-x86_64-disk.img \
   samples/pci/run_cirros_vfio_userdata_echo.sh
 ```
 
-It boots CirrOS with the fake VF assigned through VFIO, verifies guest PCI
+It boots cirros with the fake VF assigned through VFIO, verifies guest PCI
 visibility, verifies raw BAR UART loopback with `devmem`, then writes and reads
 back `ABCDEFGHIJKLMNOPQRSTUVWXYZ` through the guest-created tty.
 
 Expected success markers include:
 
 ```text
-0000:00:02.0: ttyS4 at MMIO ... is a 16450
+0000:00:02.0: ttyS4 at MMIO ... is a 16550A
 TTY_READ=ABCDEFGHIJKLMNOPQRSTUVWXYZ
 TTY_ALPHABET_PASS=/dev/ttyS4
 E2E_END
@@ -148,7 +148,6 @@ E2E_END
 Additional helper scripts are kept for narrower debugging:
 
 - `run_cirros_vfio_guest_probe.sh`: interactive-login guest probe path.
-- `run_cirros_vfio_visibility.sh`: older visibility-only flow.
 - `run_fake_pci_qemu_vfio_smoke.sh`: minimal QEMU/VFIO attach smoke test.
 
 ## Limitations

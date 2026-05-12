@@ -5,6 +5,7 @@
 set -euo pipefail
 
 MODULE=${MODULE:-samples/pci/fake_pci_sriov.ko}
+MODULE_ARGS=${MODULE_ARGS:-vf_serial_class=1}
 VENDOR=${VENDOR:-0x1d55}
 PF_DEVICE=${PF_DEVICE:-0x1000}
 VF_DEVICE=${VF_DEVICE:-0x1001}
@@ -56,8 +57,9 @@ command -v timeout
 sudo -n true
 
 if ! grep -q '^fake_pci_sriov ' /proc/modules; then
-	msg "loading fake_pci_sriov"
-	sudo -n insmod "$MODULE"
+	msg "loading fake_pci_sriov $MODULE_ARGS"
+	# shellcheck disable=SC2086
+	sudo -n insmod "$MODULE" $MODULE_ARGS
 else
 	msg "fake_pci_sriov already loaded"
 fi
@@ -76,7 +78,7 @@ VF=$(find_dev "$VF_DEVICE")
 msg "VF=$VF"
 readlink -f "/sys/bus/pci/devices/$VF/driver" || true
 
-msg "bind VF to vfio-pci"
+msg "bind VF to pci_sim_vfio_pci"
 sudo -n modprobe vfio-pci
 if [ "$ALLOW_UNSAFE_INTERRUPTS" = 1 ] && \
    [ -e /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts ]; then
@@ -86,7 +88,7 @@ fi
 if [ -e "/sys/bus/pci/devices/$VF/driver/unbind" ]; then
 	echo "$VF" | sudo -n tee "/sys/bus/pci/devices/$VF/driver/unbind" >/dev/null
 fi
-echo vfio-pci | sudo -n tee "/sys/bus/pci/devices/$VF/driver_override" >/dev/null
+echo pci_sim_vfio_pci | sudo -n tee "/sys/bus/pci/devices/$VF/driver_override" >/dev/null
 echo "$VF" | sudo -n tee /sys/bus/pci/drivers_probe >/dev/null
 readlink -f "/sys/bus/pci/devices/$VF/driver"
 

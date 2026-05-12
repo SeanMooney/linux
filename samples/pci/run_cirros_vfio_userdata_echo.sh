@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
-# Boot CirrOS with config-drive user_data to test the passed-through fake VF
+# Boot cirros with config-drive user_data to test the passed-through fake VF
 # from inside the guest.  Bounded by outer timeout and internal QEMU deadline.
 set -euo pipefail
 
@@ -120,7 +120,7 @@ PF=$(find_dev "$PF_DEVICE"); msg "PF=$PF"; echo 0 | sudo -n tee "/sys/bus/pci/de
 VF=$(find_dev "$VF_DEVICE"); msg "VF=$VF"; [ -e /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts ] && echo Y | sudo -n tee /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts >/dev/null
 [ -e "/sys/bus/pci/devices/$VF/driver/unbind" ] && echo "$VF" | sudo -n tee "/sys/bus/pci/devices/$VF/driver/unbind" >/dev/null; echo pci_sim_vfio_pci | sudo -n tee "/sys/bus/pci/devices/$VF/driver_override" >/dev/null; echo "$VF" | sudo -n tee /sys/bus/pci/drivers_probe >/dev/null; readlink -f "/sys/bus/pci/devices/$VF/driver"
 
-msg "boot CirrOS with config-drive"
+msg "boot cirros with config-drive"
 export IMAGE VF QEMU_DEADLINE CONFIG_ISO="$WORK/configdrive.iso"
 python3 - <<'PY'
 import os, pty, select, subprocess, sys, time
