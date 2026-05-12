@@ -1,10 +1,11 @@
 # Fake PCI SR-IOV VFIO test fixture
 
 `fake_pci_sriov.ko` is a self-contained sample module for testing SR-IOV
-control-plane flows without physical SR-IOV hardware.  It creates a fake PCI
-host bridge, one physical function (PF), and software-created virtual functions
-(VFs).  The VFs can be bound to VFIO and assigned to a QEMU guest, making the
-sample useful for OpenStack Nova/libvirt/QEMU SR-IOV testing.
+control-plane flows without physical SR-IOV hardware.  It creates one or more
+fake PCI host bridges, each with one physical function (PF) and
+software-created virtual functions (VFs).  The VFs can be bound to VFIO and
+assigned to a QEMU guest, making the sample useful for OpenStack
+Nova/libvirt/QEMU SR-IOV testing.
 
 The emulated VF payload is intentionally small: a 16550-style UART loopback.
 It exists to prove that a VF assigned through VFIO is visible and usable inside
@@ -12,11 +13,11 @@ a guest such as cirros.
 
 ## Architecture
 
-The sample contains four pieces:
+The sample contains these pieces:
 
-- **Fake PCI topology**: a fake host bridge with a PF (`1d55:1000`) and up to
-  seven VFs (`1d55:1001`).  VFs are enabled through the PF `sriov_numvfs` sysfs
-  attribute.
+- **Fake PCI topology**: one or more fake host bridges.  Each bridge has one PF
+  (`1d55:1000`) and up to seven VFs (`1d55:1001`).  VFs are enabled through the
+  PF `sriov_numvfs` sysfs attribute.
 - **Software IOMMU model**: enough IOMMU/group behavior for VFIO assignment in
   the test environment.
 - **VFIO PCI backend**: `pci_sim_vfio_pci`, an override-only VFIO PCI driver for
@@ -66,7 +67,8 @@ make -C /path/to/build \
   modules
 ```
 
-The sample depends on `VFIO_PCI_CORE`.
+Required kernel options include PCI, IOMMU API, TTY, and VFIO PCI core support.
+The sample Kconfig dependency is `PCI && IOMMU_API && VFIO_PCI_CORE`.
 
 ## Module parameters
 
@@ -90,7 +92,13 @@ The sample depends on `VFIO_PCI_CORE`.
 ```sh
 sudo modprobe vfio-pci
 sudo insmod samples/pci/fake_pci_sriov.ko vf_serial_class=1
+```
 
+The module also registers a host-side loopback driver.  If the new VF binds to
+`pci_sim_loopback_vf` first, unbind it and use `driver_override` to bind the VF
+to `pci_sim_vfio_pci` for VFIO assignment:
+
+```sh
 PF=$(basename /sys/bus/pci/devices/* | while read d; do
   [ "$(cat /sys/bus/pci/devices/$d/vendor 2>/dev/null)" = 0x1d55 ] && \
   [ "$(cat /sys/bus/pci/devices/$d/device 2>/dev/null)" = 0x1000 ] && \
@@ -117,9 +125,10 @@ sudo qemu-system-x86_64 ... -device vfio-pci,host=$VF
 ## Host-side tty loopback
 
 For local debugging without QEMU, bind a VF to `pci_sim_loopback_vf` instead of
-`pci_sim_vfio_pci`.  The driver creates `/dev/ttyPCI_SIM*` devices with
-independent FIFO state per VF.  Bytes written to one VF's tty can be read back
-from the same tty.
+`pci_sim_vfio_pci`.  With the default vendor-specific VF class, this usually
+happens automatically when VFs are enabled.  The driver creates
+`/dev/ttyPCI_SIM*` devices with independent FIFO state per VF.  Bytes written to
+one VF's tty can be read back from the same tty.
 
 This path is useful for validating VF creation/removal and UART FIFO lifetime
 rules before involving VFIO or a guest.
@@ -154,6 +163,7 @@ Additional helper scripts are kept for narrower debugging:
 - `run_fake_pci_qemu_vfio_smoke.sh`: minimal QEMU/VFIO attach smoke test.
 - `run_fake_pci_multi_pf_smoke.sh`: host-side smoke test for `num_pfs` and
   independent VF creation/removal across PFs.
+- `test_pci_sim_loopback.py`: host-side `/dev/ttyPCI_SIM*` loopback smoke test.
 
 ## Limitations
 
@@ -216,7 +226,8 @@ echo 1 | sudo tee /sys/bus/pci/devices/0001:00:00.0/sriov_numvfs
 echo 1 | sudo tee /sys/bus/pci/devices/0002:00:00.0/sriov_numvfs
 ```
 
-The host-side multi-PF smoke test is:
+The host-side multi-PF smoke test loads `num_pfs=2`, enables one VF on each PF,
+checks independent IOMMU groups, disables the VFs, and unloads the module:
 
 ```sh
 samples/pci/run_fake_pci_multi_pf_smoke.sh
@@ -230,8 +241,9 @@ samples/pci/run_fake_pci_multi_pf_smoke.sh
 | Device ID | `0x1000` | `0x1001` |
 | Host-visible default class | Serial controller (`0x070002`) | Vendor-specific (`0xff0000`) |
 | Optional host-visible VF class | N/A | Serial controller (`0x070002`) with `vf_serial_class=1` |
-| VFIO guest-compatible identity | N/A | SGI IOC3 serial (`10a9:0003`) with `vfio_guest_8250_compat=1` |
-| BAR0 | 4 KiB host-visible MMIO resource | 4 KiB host-visible MMIO resource; VFIO may expose a larger SGI IOC3 compatibility window |
+| VFIO guest-compatible identity | N/A | SGI IOC3 serial (`10a9:0003`) when `vfio_guest_8250_compat=1` |
+| BAR0 | 4 KiB host-visible MMIO resource | 4 KiB host-visible MMIO resource |
+| VFIO BAR0 | N/A | 4 KiB by default, or SGI IOC3 compatibility window when `vfio_guest_8250_compat=1` |
 | Max VFs per PF | 7 | N/A |
 | Host loopback device | N/A | `/dev/ttyPCI_SIM<N>` when bound to `pci_sim_loopback_vf` |
 
